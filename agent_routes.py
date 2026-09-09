@@ -70,6 +70,14 @@ def resolve_api_key() -> str:
     ).strip()
 
 
+def resolve_web_search() -> bool:
+    """Web search is a per-machine preference; the env var wins when set."""
+    env = os.environ.get("PIXIO_AGENT_WEB_SEARCH")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(_read_config().get("web_search", False))
+
+
 def resolve_model() -> str:
     return (
         os.environ.get("PIXIO_AGENT_MODEL")
@@ -107,6 +115,8 @@ async def pixio_agent_get_config(request):
             ),
             # never return the key itself
             "key_hint": f"…{key[-4:]}" if key else None,
+            "web_search": resolve_web_search(),
+            "web_search_from_env": os.environ.get("PIXIO_AGENT_WEB_SEARCH") is not None,
         }
     )
 
@@ -121,6 +131,8 @@ async def pixio_agent_set_config(request):
     cfg = _read_config()
     if isinstance(body.get("model"), str) and body["model"].strip():
         cfg["model"] = body["model"].strip()
+    if "web_search" in body:
+        cfg["web_search"] = bool(body.get("web_search"))
     if "api_key" in body:
         key = (body.get("api_key") or "").strip()
         if key:
@@ -129,6 +141,73 @@ async def pixio_agent_set_config(request):
             cfg.pop("api_key", None)
     _write_config(cfg)
     return await pixio_agent_get_config(request)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter catalog — so the UI offers a real model picker, not a text field
+# ---------------------------------------------------------------------------
+
+_MODEL_CACHE = {"at": 0.0, "models": []}
+_MODEL_TTL = 1800
+
+
+def _wants_tools(model: dict) -> bool:
+    """Only models that can call tools can drive this agent."""
+    params = model.get("supported_parameters") or []
+    return "tools" in params or "tool_choice" in params
+
+
+@routes.get("/pixio-agent/openrouter-models")
+async def pixio_agent_openrouter_models(request):
+    """Tool-capable OpenRouter models, newest-capable first.
+
+    The catalog is public, so this works before a key is configured; the key is
+    only attached when present so per-account availability is reflected.
+    """
+    now = time.time()
+    force = request.query.get("refresh") == "1"
+    if not force and _MODEL_CACHE["models"] and now - _MODEL_CACHE["at"] < _MODEL_TTL:
+        return web.json_response({"models": _MODEL_CACHE["models"], "cached": True})
+
+    headers = {"Content-Type": "application/json"}
+    key = resolve_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://openrouter.ai/api/v1/models", headers=headers) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"OpenRouter returned {resp.status}")
+                data = await resp.json()
+    except Exception as e:  # noqa: BLE001 — the UI falls back to a text field
+        logger.warning("could not fetch the OpenRouter catalog: %s", e)
+        if _MODEL_CACHE["models"]:
+            return web.json_response({"models": _MODEL_CACHE["models"], "stale": True})
+        return web.json_response({"error": str(e), "models": []}, status=502)
+
+    models = []
+    for model in data.get("data") or []:
+        if not _wants_tools(model):
+            continue
+        pricing = model.get("pricing") or {}
+        modalities = (model.get("architecture") or {}).get("input_modalities") or []
+        models.append(
+            {
+                "id": model.get("id"),
+                "name": model.get("name") or model.get("id"),
+                "context": model.get("context_length"),
+                "prompt_price": pricing.get("prompt"),
+                "completion_price": pricing.get("completion"),
+                "vision": "image" in modalities,
+                "provider": (model.get("id") or "").split("/")[0],
+            }
+        )
+
+    models.sort(key=lambda m: (m["provider"] or "", m["name"] or ""))
+    _MODEL_CACHE.update({"at": now, "models": models})
+    return web.json_response({"models": models})
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +269,70 @@ def _custom_node_templates():
     return found
 
 
+# Comfy-Org publishes the canonical template library, which is newer and far
+# larger than whatever ships with an installed frontend. We read its index over
+# raw.githubusercontent (no API token, no rate-limit surprises), cache it, and
+# fall back silently to local templates when offline.
+
+UPSTREAM_TEMPLATES_BASE = (
+    "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates"
+)
+_UPSTREAM_CACHE = {"at": 0.0, "templates": []}
+_UPSTREAM_TTL = 3600
+
+
+async def _fetch_json(url, timeout=20):
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout, connect=10)
+    ) as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"{url} returned {resp.status}")
+            # raw.githubusercontent serves JSON as text/plain
+            return json.loads(await resp.text())
+
+
+async def _upstream_templates():
+    now = time.time()
+    if _UPSTREAM_CACHE["templates"] and now - _UPSTREAM_CACHE["at"] < _UPSTREAM_TTL:
+        return _UPSTREAM_CACHE["templates"]
+    try:
+        index = await _fetch_json(f"{UPSTREAM_TEMPLATES_BASE}/index.json")
+    except Exception as e:  # noqa: BLE001 — offline machines keep working
+        logger.warning("could not fetch the Comfy-Org template index: %s", e)
+        return _UPSTREAM_CACHE["templates"]
+
+    templates = []
+    for category in index if isinstance(index, list) else []:
+        for tpl in category.get("templates", []) or []:
+            name = tpl.get("name")
+            if not name:
+                continue
+            # `models` is a list of names here and a list of objects in the
+            # bundled index — accept both.
+            models = [
+                m.get("name") if isinstance(m, dict) else str(m)
+                for m in tpl.get("models") or []
+            ]
+            templates.append(
+                {
+                    "source": "comfy-org",
+                    "name": name,
+                    "title": tpl.get("title") or name,
+                    "description": tpl.get("description", ""),
+                    "category": category.get("title") or category.get("moduleName"),
+                    "models": [m for m in models if m],
+                    "tags": tpl.get("tags") or [],
+                    # the agent needs to warn before loading something unusable
+                    "requires_custom_nodes": tpl.get("requiresCustomNodes") or [],
+                    "min_comfyui_version": tpl.get("minComfyUIVersion"),
+                    "tutorial_url": tpl.get("tutorialUrl"),
+                }
+            )
+    _UPSTREAM_CACHE.update({"at": now, "templates": templates})
+    return templates
+
+
 @routes.get("/pixio-agent/templates")
 async def pixio_agent_templates(request):
     query = (request.query.get("query") or "").lower()
@@ -221,6 +364,8 @@ async def pixio_agent_templates(request):
                 if f.name == "index.json":
                     continue
                 results.append({"source": "core", "name": f.stem, "title": f.stem, "description": "", "category": None})
+
+    results.extend(await _upstream_templates())
 
     for module, entries in _custom_node_templates().items():
         for tpl in entries:
@@ -256,6 +401,15 @@ async def pixio_agent_template(request):
     name = request.query.get("name") or ""
     if not name or "/" in name or "\\" in name or ".." in name:
         return web.json_response({"error": "invalid template name"}, status=400)
+
+    if source == "comfy-org":
+        try:
+            workflow = await _fetch_json(f"{UPSTREAM_TEMPLATES_BASE}/{name}.json", timeout=30)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response(
+                {"error": f"could not fetch the Comfy-Org template '{name}': {e}"}, status=502
+            )
+        return web.json_response({"workflow": workflow})
 
     if source == "core":
         core_dir = _core_templates_dir()
@@ -426,8 +580,19 @@ def _node_index(limit=900):
     return text
 
 
-def _build_system(context):
+def _build_system(context, web_search: bool = False):
     parts = [SYSTEM_PROMPT]
+    if web_search:
+        parts.append(
+            "# Web search\n"
+            "You can search the web. Use it for what this machine cannot tell you: what a "
+            "brand-new model or custom node is, the recommended settings for an unfamiliar "
+            "checkpoint, a node pack's repository URL when the user needs to install it, or "
+            "current documentation for a workflow pattern. Do NOT use it for anything the "
+            "local tools already answer - installed node types, model filenames, this graph, "
+            "or the user's account. Prefer one focused search, and say when a claim came "
+            "from the web."
+        )
     lines = []
     index = _node_index()
     if index:
@@ -480,11 +645,21 @@ async def pixio_agent_chat(request):
         return web.json_response({"error": "messages required"}, status=400)
 
     model = (body.get("model") or "").strip() or resolve_model()
+
+    # OpenRouter runs this one itself and returns the result inline — the
+    # browser never executes it, so it simply joins the tool list.
+    web_search = body.get("web_search")
+    web_search = resolve_web_search() if web_search is None else bool(web_search)
+    tools = [*TOOLS, {"type": "openrouter:web_search"}] if web_search else TOOLS
+
     payload = {
         "model": model,
         "stream": True,
-        "messages": [{"role": "system", "content": _build_system(body.get("context"))}, *messages],
-        "tools": TOOLS,
+        "messages": [
+            {"role": "system", "content": _build_system(body.get("context"), web_search=web_search)},
+            *messages,
+        ],
+        "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": False,
         "max_tokens": int(os.environ.get("PIXIO_AGENT_MAX_TOKENS", "8000")),

@@ -122,12 +122,25 @@ function buildPanel(rootEl) {
   warn.style.display = "none";
 
   const keyInput = el("input", { type: "password", placeholder: "sk-or-v1-… (stored on this machine)" });
-  const modelInput = el("input", { type: "text", placeholder: "anthropic/claude-sonnet-4.5" });
+  const modelInput = el("input", {
+    type: "text",
+    list: "pxa-models",
+    placeholder: "anthropic/claude-sonnet-4.5",
+  });
+  // A datalist keeps this dependency-free while still offering the real
+  // catalog: type to filter, or paste any id.
+  const modelList = el("datalist", { id: "pxa-models" });
+  const webSearch = el("input", { type: "checkbox", id: "pxa-web" });
   const cfg = el("div", { class: "pxa-cfg" }, [
     el("div", { text: "OpenRouter API key" }),
     keyInput,
     el("div", { text: "Model" }),
     modelInput,
+    modelList,
+    el("label", { class: "pxa-row", style: "gap:6px;cursor:pointer" }, [
+      webSearch,
+      el("span", { text: "Web search (lets the agent look things up)" }),
+    ]),
     el("div", { class: "pxa-row" }, [
       el("button", {
         class: "pxa-btn",
@@ -137,6 +150,7 @@ function buildPanel(rootEl) {
             await saveConfig({
               model: modelInput.value.trim() || undefined,
               api_key: keyInput.value.trim() || undefined,
+              web_search: webSearch.checked,
             });
             keyInput.value = "";
             toggleConfig(false);
@@ -179,10 +193,32 @@ function buildPanel(rootEl) {
 
   rootEl.append(head, warn, cfg, log, compose);
 
+  let catalogLoaded = false;
+
+  async function loadCatalog() {
+    if (catalogLoaded) return;
+    catalogLoaded = true;
+    try {
+      const res = await fetch("/pixio-agent/openrouter-models");
+      const { models = [] } = res.ok ? await res.json() : {};
+      modelList.innerHTML = "";
+      for (const model of models) {
+        modelList.append(el("option", { value: model.id, label: model.name }));
+      }
+    } catch {
+      catalogLoaded = false; // let the next open retry
+    }
+  }
+
   function toggleConfig(force) {
     const show = force ?? cfg.style.display === "none";
     cfg.style.display = show ? "flex" : "none";
-    if (show) modelInput.value = store.config?.model ?? "";
+    if (show) {
+      modelInput.value = store.config?.model ?? "";
+      webSearch.checked = !!store.config?.web_search;
+      webSearch.disabled = !!store.config?.web_search_from_env;
+      void loadCatalog();
+    }
   }
 
   async function onUndo() {
@@ -203,7 +239,9 @@ function buildPanel(rootEl) {
   function renderConfig(config) {
     const ok = !!config?.has_key;
     dot.className = `pxa-dot${ok ? "" : " off"}`;
-    modelLabel.textContent = (config?.model ?? "").split("/").pop() || "not configured";
+    modelLabel.textContent =
+      ((config?.model ?? "").split("/").pop() || "not configured") +
+      (config?.web_search ? " · web" : "");
     warn.style.display = ok ? "none" : "block";
     warn.textContent = "No OpenRouter key. Click ⚙ to add one, or set OPENROUTER_API_KEY on the machine.";
   }

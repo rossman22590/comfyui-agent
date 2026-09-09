@@ -149,11 +149,11 @@ export async function loadConfig(force = false) {
   return store.config;
 }
 
-export async function saveConfig({ model, api_key }) {
+export async function saveConfig({ model, api_key, web_search }) {
   const res = await fetch("/pixio-agent/config", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, api_key }),
+    body: JSON.stringify({ model, api_key, web_search }),
   });
   if (!res.ok) throw new Error(`could not save settings (${res.status})`);
   store.config = await res.json();
@@ -694,7 +694,17 @@ const HOST_HANDLERS = {
   },
   agent_undo: async () => undoLast(),
   agent_config: async (data) =>
-    data && (data.model || "api_key" in data) ? saveConfig(data) : loadConfig(true),
+    data && (data.model || "api_key" in data || "web_search" in data)
+      ? saveConfig(data)
+      : loadConfig(true),
+  /** The OpenRouter catalog, so a host UI can offer a real model picker. */
+  agent_model_catalog: async (data) => {
+    const res = await fetch(
+      `/pixio-agent/openrouter-models${data?.refresh ? "?refresh=1" : ""}`,
+    );
+    if (!res.ok) throw new Error(`could not load the model catalog (${res.status})`);
+    return res.json();
+  },
   agent_get_prompt: async () => getPrompt(),
   // direct tool access, so the host can read the graph without a model turn
   agent_tool: async ({ name, args }) => {
