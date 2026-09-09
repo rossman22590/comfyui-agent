@@ -325,9 +325,12 @@ TOOLS = [
         "function": {
             "name": "run_history",
             "description": (
-                "ComfyUI's own execution history on this machine — prompts already run, including ones "
-                "from before this conversation, with their output filenames and the exception that ended "
-                "any failure. Use it to diagnose 'it was broken when I got here' without re-running."
+                "ComfyUI's own execution history on THIS machine — prompts already run in this editor "
+                "session, with their output filenames and the exception that ended any failure. Use it to "
+                "diagnose 'it was broken when I got here' without re-running. It is empty for a fresh "
+                "session, and for runs made through the API or on a different machine — that is normal, "
+                "not a fault: use list_workflow_runs for the account's history instead of reporting a "
+                "problem."
             ),
             "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 8}}},
         },
