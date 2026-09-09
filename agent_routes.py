@@ -36,7 +36,15 @@ routes = server.PromptServer.instance.routes
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"
-CONFIG_PATH = Path(__file__).parent / "config.json"
+# Where the key is kept.
+#
+# A serverless machine's filesystem is rebuilt from its image, so anything
+# written next to this file is gone on the next cold start — the user would be
+# retyping the key every session. Pixio mounts a writable per-user volume at
+# /private_models, so prefer that: it survives restarts and rebuilds, and every
+# machine on the same account sees it. Local installs fall back to the node
+# folder, which is persistent there anyway.
+PERSISTENT_CONFIG_DIR = "/private_models/.pixio-agent"
 MAX_TOOL_RESULT_CHARS = 60_000
 MAX_MESSAGES = 400
 
@@ -46,17 +54,62 @@ MAX_MESSAGES = 400
 # ---------------------------------------------------------------------------
 
 
+def _config_dirs():
+    """Candidate directories, most durable first."""
+    dirs = []
+    override = os.environ.get("PIXIO_AGENT_CONFIG_DIR")
+    if override:
+        dirs.append(Path(override))
+    # only when the mount is actually present, so a local run never creates it
+    volume = Path(PERSISTENT_CONFIG_DIR)
+    if volume.parent.is_dir():
+        dirs.append(volume)
+    dirs.append(Path(__file__).parent)
+    return dirs
+
+
+def _config_path_for_write() -> Path:
+    for directory in _config_dirs():
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            probe = directory / ".write-probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return directory / "config.json"
+        except Exception:  # noqa: BLE001 — read-only mount, try the next one
+            continue
+    return Path(__file__).parent / "config.json"
+
+
+def _config_path_for_read():
+    for directory in _config_dirs():
+        candidate = directory / "config.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def config_storage() -> str:
+    """Where a saved key would live — surfaced so the UI can promise durability."""
+    path = _config_path_for_write()
+    return "volume" if str(path).startswith(PERSISTENT_CONFIG_DIR) else "node"
+
+
 def _read_config() -> dict:
+    path = _config_path_for_read()
+    if not path:
+        return {}
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 — missing/corrupt config is not fatal
         return {}
 
 
 def _write_config(data: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    path = _config_path_for_write()
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     try:
-        os.chmod(CONFIG_PATH, 0o600)
+        os.chmod(path, 0o600)
     except Exception:  # noqa: BLE001 — best effort (Windows / odd filesystems)
         pass
 
@@ -115,6 +168,12 @@ async def pixio_agent_get_config(request):
             ),
             # never return the key itself
             "key_hint": f"…{key[-4:]}" if key else None,
+            "storage": "env" if os.environ.get("OPENROUTER_API_KEY") or os.environ.get("PIXIO_AGENT_API_KEY") else config_storage(),
+            "persists_across_rebuilds": bool(
+                os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("PIXIO_AGENT_API_KEY")
+                or config_storage() == "volume"
+            ),
             "web_search": resolve_web_search(),
             "web_search_from_env": os.environ.get("PIXIO_AGENT_WEB_SEARCH") is not None,
         }

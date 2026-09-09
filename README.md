@@ -63,8 +63,11 @@ The agent talks to [OpenRouter](https://openrouter.ai), so you can point it at
 any frontier model. Give it a key either way:
 
 - set `OPENROUTER_API_KEY` on the machine (recommended), or
-- open the ✨ **Workflow Agent** sidebar tab → ⚙ → paste a key. It is stored in
-  `config.json` next to this node (git-ignored, `chmod 600`) — never inside a
+- open the ✨ **Workflow Agent** sidebar tab → ⚙ → paste a key. It is written to
+  `config.json` (git-ignored, `chmod 600`) on the machine's persistent volume
+  when one is mounted, so it survives restarts and rebuilds; otherwise it lands
+  next to this node, which a rebuilt image discards. The settings panel says
+  which of the two you have. `PIXIO_AGENT_CONFIG_DIR` overrides the location — never inside a
   workflow and never returned by the config API. When entered in the settings
   form, the key is submitted from the browser to that machine.
 
