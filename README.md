@@ -48,9 +48,12 @@ agent requests, which run on your machine using its OpenRouter key.
   workflow it can build from what you do have.
 - **It never eats your work.** Asking for a *new* workflow opens a new tab; the
   canvas you have open is not cleared. Batched edits are one Undo.
-- **It remembers, and it forgets on purpose.** The conversation survives an
-  editor reload, while older tool results are replaced by their summary before
-  each turn so a long build cannot run out of context mid-way.
+- **The chat belongs to the workflow.** It is saved on the machine — on your
+  account's persistent volume where one is mounted, beside the API key — keyed
+  by workflow, so reopening that workflow anywhere brings the thread back. The
+  browser keeps its own copy for instant paint, and the newer of the two wins.
+  Older tool results are replaced by their summary before each turn so a long
+  build cannot run out of context mid-way.
 
 ## Install
 

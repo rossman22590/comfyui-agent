@@ -60,9 +60,46 @@ function activateWorkspace(context) {
     STORAGE_KEY = "pixio-agent.conversation." + context.scope;
     restore();
     store.messages = completeToolHistory(store.messages);
+    workspaceContext = context; // conversationKey() needs it before we fetch
+    void restoreFromServer();
   }
   workspaceContext = context;
   emit({ type: "reset-view" });
+}
+
+/**
+ * Where this conversation belongs.
+ *
+ * A chat is about a workflow, not about a browser tab, so it is keyed by the
+ * workflow when the host tells us one — the same thread then reappears in a
+ * later session, on another machine, or in a different browser. Standalone
+ * ComfyUI has no workflow id, so it falls back to the workspace scope.
+ */
+function conversationKey() {
+  return workspaceContext?.workflow_id
+    ? `workflow:${workspaceContext.workflow_id}`
+    : STORAGE_KEY;
+}
+
+let saveTimer;
+
+/** Mirror the conversation to the machine, which may hold a persistent volume. */
+function saveToServer() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fetch("/pixio-agent/conversation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        key: conversationKey(),
+        workflow_id: workspaceContext?.workflow_id ?? null,
+        messages: store.messages.slice(-120),
+        usage: store.usage,
+      }),
+    }).catch(() => {
+      // the local copy is still there; durability is best effort
+    });
+  }, 1500);
 }
 
 export function persist() {
@@ -73,6 +110,42 @@ export function persist() {
     );
   } catch {
     // quota or private mode — the conversation just won't survive a reload
+  }
+  saveToServer();
+}
+
+/**
+ * Pull the machine's copy, which outlives this browser. Local restore has
+ * already run synchronously, so this only replaces what is on screen when the
+ * saved copy is genuinely newer — reopening a workflow elsewhere should not
+ * roll back the messages already in front of the user.
+ */
+export async function restoreFromServer() {
+  const key = conversationKey();
+  try {
+    const res = await fetch(
+      `/pixio-agent/conversation?key=${encodeURIComponent(key)}`,
+    );
+    if (!res.ok) return false;
+    const saved = await res.json();
+    if (!saved?.found || !saved.messages?.length) return false;
+    if (key !== conversationKey()) return false; // the user moved on while we fetched
+    const localAt = localSavedAt();
+    if (localAt && saved.at && saved.at <= localAt) return false;
+    store.messages = completeToolHistory(saved.messages);
+    store.usage = saved.usage ?? store.usage;
+    emit({ type: "reset-view" });
+    return true;
+  } catch {
+    return false; // offline or an older node build without the route
+  }
+}
+
+function localSavedAt() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null")?.at ?? 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -898,7 +971,10 @@ app.registerExtension({
       return options;
     };
 
-    if (!isEmbedded()) restore();
+    if (!isEmbedded()) {
+      restore();
+      void restoreFromServer();
+    }
     watchExecution();
     installHostBridge();
     loadConfig().catch(() => {

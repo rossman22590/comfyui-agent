@@ -14,6 +14,7 @@ Routes
   GET/POST /pixio-agent/config  read / set model + API key (persisted locally)
 """
 
+import hashlib
 import inspect
 import json
 import logging
@@ -267,6 +268,100 @@ async def pixio_agent_openrouter_models(request):
     models.sort(key=lambda m: (m["provider"] or "", m["name"] or ""))
     _MODEL_CACHE.update({"at": now, "models": models})
     return web.json_response({"models": models})
+
+
+# ---------------------------------------------------------------------------
+# conversations: the chat follows the workflow, not the browser
+# ---------------------------------------------------------------------------
+#
+# localStorage keeps a conversation alive across a reload, but only in the
+# browser that made it — a different machine, browser or device starts blank,
+# and a cleared cache loses it. Saving beside the API key puts it on the
+# account's persistent volume when one is mounted, so a workflow's chat is
+# there wherever the user opens it.
+#
+# The key deliberately reuses _config_path_for_write(): whatever durability the
+# API key has, the conversation has too. It is never gated on anything extra.
+
+CONVERSATION_MAX_BYTES = 1_000_000
+CONVERSATION_MAX_MESSAGES = 200
+
+
+def _conversation_path(key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return _config_path_for_write().parent / "conversations" / f"{digest}.json"
+
+
+@routes.get("/pixio-agent/conversation")
+async def pixio_agent_get_conversation(request):
+    key = (request.query.get("key") or "").strip()
+    if not key:
+        return web.json_response({"error": "key is required"}, status=400)
+    path = _conversation_path(key)
+    if not path.is_file():
+        return web.json_response({"found": False})
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 — a corrupt file must not block the UI
+        logger.warning("could not read a saved conversation: %s", e)
+        return web.json_response({"found": False})
+    saved["found"] = True
+    saved["storage"] = config_storage()
+    return web.json_response(saved)
+
+
+@routes.post("/pixio-agent/conversation")
+async def pixio_agent_save_conversation(request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    key = (body.get("key") or "").strip()
+    messages = body.get("messages")
+    if not key or not isinstance(messages, list):
+        return web.json_response({"error": "key and messages are required"}, status=400)
+
+    record = {
+        "key": key,
+        "messages": messages[-CONVERSATION_MAX_MESSAGES:],
+        "usage": body.get("usage"),
+        "workflow_id": body.get("workflow_id"),
+        "at": int(time.time() * 1000),
+    }
+    payload = json.dumps(record)
+    # drop the oldest half rather than refusing the write and losing everything
+    while len(payload) > CONVERSATION_MAX_BYTES and len(record["messages"]) > 2:
+        record["messages"] = record["messages"][len(record["messages"]) // 2 :]
+        payload = json.dumps(record)
+
+    path = _conversation_path(key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # write-then-replace so a crash mid-write cannot truncate the record
+        temp = path.with_suffix(".json.tmp")
+        temp.write_text(payload, encoding="utf-8")
+        os.replace(temp, path)
+    except Exception as e:  # noqa: BLE001 — a read-only volume must not break chat
+        logger.warning("could not save the conversation: %s", e)
+        return web.json_response({"saved": False, "error": str(e)}, status=200)
+
+    return web.json_response(
+        {"saved": True, "messages": len(record["messages"]), "storage": config_storage()}
+    )
+
+
+@routes.delete("/pixio-agent/conversation")
+async def pixio_agent_delete_conversation(request):
+    key = (request.query.get("key") or "").strip()
+    if not key:
+        return web.json_response({"error": "key is required"}, status=400)
+    path = _conversation_path(key)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not delete the conversation: %s", e)
+    return web.json_response({"deleted": True})
 
 
 # ---------------------------------------------------------------------------

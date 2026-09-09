@@ -342,3 +342,39 @@ test("a saved conversation survives a reload", async () => {
   assert.equal(runtime.store.messages[0].content, "build me a music workflow");
   assert.equal(runtime.store.usage.turns, 1, "usage comes back too");
 });
+
+test("a workflow's chat is keyed to the workflow and only replaced when newer", async () => {
+  resetGraph();
+  const local = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => local.get(k) ?? null,
+    setItem: (k, v) => local.set(k, v),
+  };
+  const posted = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith("/pixio-agent/conversation") && init?.method === "POST") {
+      posted.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ saved: true }));
+    }
+    // the machine holds an OLDER copy than what is on screen
+    return new Response(JSON.stringify({
+      found: true, at: 1000,
+      messages: [{ id: "old", role: "user", content: "yesterday" }],
+    }));
+  };
+
+  runtime.store.messages = [{ id: "n1", role: "user", content: "today" }];
+  local.set("pixio-agent.conversation.standalone", JSON.stringify({ messages: [], at: 9000 }));
+
+  const replaced = await runtime.restoreFromServer();
+  assert.equal(replaced, false, "an older saved copy must not roll back the screen");
+  assert.equal(runtime.store.messages[0].content, "today");
+
+  // and a newer one does come through
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    found: true, at: 99000,
+    messages: [{ id: "s1", role: "user", content: "from another browser" }],
+  }));
+  assert.equal(await runtime.restoreFromServer(), true);
+  assert.equal(runtime.store.messages[0].content, "from another browser");
+});
