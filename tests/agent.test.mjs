@@ -32,7 +32,7 @@ let graphCode = await readFile(new URL("../web/agent-graph.js", import.meta.url)
 graphCode = graphCode.replace('import { app } from "../../scripts/app.js";', "const app = globalThis.__agentTestApp;")
   .replace('"./agent-stream-parser.js"', JSON.stringify(parserURL));
 const graphURL = dataModule(graphCode);
-const { createStreamingApplier, applyOps, TOOL_IMPL } = await import(graphURL);
+const { createStreamingApplier, applyOps, TOOL_IMPL, forgetObjectInfo } = await import(graphURL);
 let runtimeCode = await readFile(new URL("../web/agent-runtime.js", import.meta.url), "utf8");
 runtimeCode = runtimeCode.replace('import { app } from "../../scripts/app.js";', "const app = globalThis.__agentTestApp;")
   .replace('"./agent-graph.js"', JSON.stringify(graphURL));
@@ -377,4 +377,73 @@ test("a workflow's chat is keyed to the workflow and only replaced when newer", 
   }));
   assert.equal(await runtime.restoreFromServer(), true);
   assert.equal(runtime.store.messages[0].content, "from another browser");
+});
+
+test("a paid API node says it is paid, and a model search says to look elsewhere", async () => {
+  forgetObjectInfo(); // earlier tests populated the node-definition cache
+  // the real failure this guards: asked for "krea 2 turbo", the agent picked
+  // Krea2ImageNode — a paid Krea endpoint — because nothing in the tool output
+  // said it was hosted, while the local checkpoint sat in list_models.
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({
+      Krea2ImageNode: {
+        display_name: "Krea 2 Image", category: "api node/image/Krea",
+        api_node: true, input: {}, output: ["IMAGE"],
+      },
+      CheckpointLoaderSimple: {
+        display_name: "Load Checkpoint", category: "loaders", input: {}, output: ["MODEL"],
+      },
+    }));
+
+  const found = await TOOL_IMPL.search_node_types({ query: "krea 2" });
+  const hosted = found.results.find((r) => r.type === "Krea2ImageNode");
+  assert.equal(hosted.hosted, true, "the paid node says so in the result");
+  assert.match(hosted.note, /costs the user credits/);
+  assert.match(found.hosted_warning, /use list_models/, "and points at where a model really lives");
+
+  const spec = await TOOL_IMPL.get_node_type_details({ types: ["Krea2ImageNode"] });
+  assert.equal(spec.nodes.Krea2ImageNode.hosted, true, "and again at the point of use");
+
+  const plain = await TOOL_IMPL.search_node_types({ query: "checkpoint" });
+  assert.equal(plain.hosted_warning, undefined, "no warning when nothing paid matched");
+});
+
+test("a loaded template says which model files are absent, without being asked", async () => {
+  // the real failure this guards: the agent loaded a Krea template, announced
+  // "100% open-source, all local models", and only discovered that
+  // krea2_turbo_int8_convrot.safetensors was never installed when the user
+  // asked "will it run?".
+  forgetObjectInfo();
+  resetGraph();
+  const OPTIONS = ["krea2_turbo_fp8_scaled.safetensors", "flux1-krea-dev.safetensors"];
+  const template = {
+    nodes: [
+      { id: 1, type: "UNETLoader", widgets_values: ["krea2_turbo_int8_convrot.safetensors"] },
+      { id: 2, type: "UNETLoader", widgets_values: ["krea2_turbo_fp8_scaled.safetensors"] },
+    ],
+  };
+  globalThis.fetch = async (url) => {
+    if (String(url).startsWith("/pixio-agent/template"))
+      return new Response(JSON.stringify({ workflow: template }));
+    return new Response(JSON.stringify({
+      UNETLoader: { input: { required: { unet_name: [OPTIONS] } }, output: ["MODEL"] },
+    }));
+  };
+  // loadGraphData is the frontend's; stand in for it with the two nodes
+  app.loadGraphData = async () => {
+    for (const n of template.nodes) {
+      app.graph.add({
+        type: n.type, mode: 0, title: n.type, pos: [0, 0], size: [200, 100],
+        inputs: [], outputs: [],
+        widgets: [{ name: "unet_name", type: "combo", value: n.widgets_values[0], options: {} }],
+      });
+    }
+  };
+
+  const result = await TOOL_IMPL.load_workflow_template({ source: "comfy-org", name: "krea" });
+  assert.equal(result.runnable, false, "a template needing an absent file is not runnable");
+  assert.equal(result.missing_models.length, 1, "only the genuinely absent file is reported");
+  assert.equal(result.missing_models[0].wanted, "krea2_turbo_int8_convrot.safetensors");
+  assert.deepEqual(result.missing_models[0].installed_options, OPTIONS, "and what to use instead");
+  assert.match(result.note, /NOT runnable/);
 });

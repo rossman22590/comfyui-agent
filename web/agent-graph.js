@@ -38,6 +38,12 @@ function truncate(str, max = 240) {
 
 let objectInfoCache = null;
 
+/** Drop cached node definitions — after a rebuild, or between tests. */
+export function forgetObjectInfo() {
+  objectInfoCache = null;
+  displayNameIndex = null;
+}
+
 async function getObjectInfo() {
   if (objectInfoCache) return objectInfoCache;
   // ComfyUI stores the server node definition on every registered class.
@@ -160,7 +166,20 @@ function scoreNodeDef(type, def, tokens) {
   const phrase = tokens.join(" ");
   if (phrase && (display.includes(phrase) || name.includes(phrase.replace(/\s+/g, "")))) score += 20;
   if (def.deprecated) score -= 15;
+  // A hosted API node costs the user credits for something a local model may
+  // do for free. Same-name matches must not put it above the local option —
+  // "krea 2" should surface the checkpoint before the paid endpoint.
+  if (isHostedNode(def)) score -= 18;
   return score;
+}
+
+/** ComfyUI marks its paid partner nodes with api_node in /object_info. */
+function isHostedNode(def) {
+  return (
+    def?.api_node === true ||
+    String(def?.category ?? "").toLowerCase().startsWith("api node") ||
+    String(def?.python_module ?? "").startsWith("comfy_api_nodes")
+  );
 }
 
 async function searchNodeTypes({ query = "", limit = 15, category }) {
@@ -174,8 +193,24 @@ async function searchNodeTypes({ query = "", limit = 15, category }) {
     scored.push({ score, type, def });
   }
   scored.sort((a, b) => b.score - a.score || a.type.localeCompare(b.type));
+  // Searching node types for a MODEL name is the trap: a paid partner node is
+  // often named after the model ("Krea 2 Image"), while the local option is a
+  // generic loader plus a checkpoint file that no node name will ever match.
+  const hostedHits = scored
+    .slice(0, limit)
+    .filter(({ def }) => isHostedNode(def))
+    .map(({ type }) => type);
   return {
     total_matches: scored.length,
+    ...(hostedHits.length
+      ? {
+          hosted_warning:
+            `Paid API nodes in these results: ${hostedHits.slice(0, 3).join(", ")}. ` +
+            "They cost the user credits. If you are looking for a MODEL rather than a node, " +
+            "use list_models — an installed model is a FILE loaded by a generically named node " +
+            "(CheckpointLoaderSimple, UNETLoader), so it never matches the model's name here.",
+        }
+      : {}),
     results: scored.slice(0, limit).map(({ type, def }) => ({
       type,
       display_name: def.display_name,
@@ -185,6 +220,12 @@ async function searchNodeTypes({ query = "", limit = 15, category }) {
       outputs: (def.output ?? []).map((t, i) => `${def.output_name?.[i] ?? t}:${Array.isArray(t) ? "COMBO" : t}`),
       output_node: !!def.output_node,
       deprecated: !!def.deprecated,
+      ...(isHostedNode(def)
+        ? {
+            hosted: true,
+            note: "Paid hosted API node — costs the user credits per run. Prefer a local model unless they asked for this service by name.",
+          }
+        : {}),
     })),
   };
 }
@@ -212,6 +253,12 @@ async function getNodeTypeDetails({ types = [], combo_limit = 40, combo_filter }
         is_list: !!def.output_is_list?.[i],
       })),
       output_node: !!def.output_node,
+      ...(isHostedNode(def)
+        ? {
+            hosted: true,
+            note: "Paid hosted API node — costs the user credits per run and needs their credentials. Use it only if they asked for this service by name, or nothing installed can do the task; say what it will cost.",
+          }
+        : {}),
     };
   }
   const suggestions = {};
@@ -1164,6 +1211,46 @@ async function listWorkflowTemplates({ query = "", limit = 20 } = {}) {
   return res.json();
 }
 
+/**
+ * Which files a loaded graph asks for that this machine does not have.
+ *
+ * A template names its checkpoints and LoRAs as plain widget strings. The
+ * graph therefore loads and even validates structurally while pointing at a
+ * file that was never downloaded — the agent then reports success and the user
+ * discovers the truth on Run. Every combo widget is checked against the
+ * options this machine actually offers, including inside subgraphs.
+ */
+function missingModelFiles(info) {
+  const missing = [];
+  const walk = (graph, scope) => {
+    for (const node of nodesOf(graph)) {
+      const def = info[node.type];
+      const spec = { ...(def?.input?.required ?? {}), ...(def?.input?.optional ?? {}) };
+      for (const widget of node.widgets ?? []) {
+        const entry = spec[widget.name];
+        const options = Array.isArray(entry?.[0]) ? entry[0] : null;
+        // only COMBO inputs whose options are a file list can be "missing"
+        if (!options || typeof widget.value !== "string" || !widget.value) continue;
+        if (!/\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx)$/i.test(widget.value)) continue;
+        if (options.includes(widget.value)) continue;
+        missing.push({
+          node_id: node.id,
+          node_type: node.type,
+          widget: widget.name,
+          wanted: widget.value,
+          installed_options: options.slice(0, 12),
+          ...(scope === "root" ? {} : { target: scope.subgraph_node }),
+        });
+      }
+      if (isSubgraphNode(node)) {
+        walk(node.subgraph, { subgraph_node: node.id, name: node.title ?? node.type });
+      }
+    }
+  };
+  walk(app.graph, "root");
+  return missing;
+}
+
 async function loadWorkflowTemplate({ source = "core", name }) {
   if (!name) throw new Error("load_workflow_template requires `name`");
   const params = new URLSearchParams({ source, name });
@@ -1185,7 +1272,20 @@ async function loadWorkflowTemplate({ source = "core", name }) {
         .filter((t) => t && !info[t] && !LiteGraph.registered_node_types?.[t]),
     ),
   ];
-  return { loaded: `${source}/${name}`, missing_node_types: missing, snapshot, graph: getGraph() };
+  const missingModels = missingModelFiles(info);
+  return {
+    loaded: `${source}/${name}`,
+    missing_node_types: missing,
+    missing_models: missingModels,
+    runnable: missing.length === 0 && missingModels.length === 0,
+    ...(missing.length || missingModels.length
+      ? {
+          note: "This template is NOT runnable as loaded. Tell the user exactly what is missing before claiming anything works: swap each widget to an installed option from installed_options, or say what they need to download.",
+        }
+      : {}),
+    snapshot,
+    graph: getGraph(),
+  };
 }
 
 // ---------------------------------------------------------------------------
