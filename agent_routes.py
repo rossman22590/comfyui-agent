@@ -127,6 +127,7 @@ def _write_config(data: dict) -> None:
 # cannot do OpenAI tool calling will chat but never build anything. That is the
 # one thing to check before pointing this at something new.
 PROVIDERS = ("openrouter", "machine")
+PROVIDER_LABELS = {"openrouter": "OpenRouter", "machine": "Machine"}
 DEFAULT_BASE_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
     # Machine: OpenAI-compatible, mach_ keys, models.dev ids
@@ -143,14 +144,38 @@ def resolve_provider() -> str:
     return name if name in PROVIDERS else "openrouter"
 
 
+def _normalize_gateway_url(url: str) -> str:
+    """Accept any of the shapes the gateway's docs suggest.
+
+    Its docs give the base as `.../v1/llm` while the endpoint is written
+    `/v1/chat/completions`, so people reasonably paste `.../v1`, `.../v1/llm`
+    or the bare host. Only the exact combination `.../v1/llm/v1` resolves, and
+    getting it wrong shows up much later as a 404 or 502 on the model list.
+    Rebuild it from whichever piece was given — but only for the gateway's own
+    host, so a different OpenAI-compatible endpoint is never rewritten.
+    """
+    trimmed = url.rstrip("/")
+    default = DEFAULT_BASE_URLS["machine"]
+    host = default.split("/v1/llm")[0]
+    if not trimmed.startswith(host):
+        return trimmed
+    for suffix in ("/v1/llm/v1", "/v1/llm", "/llm/v1", "/llm", "/v1"):
+        if trimmed.endswith(suffix):
+            trimmed = trimmed[: -len(suffix)]
+            break
+    return f"{trimmed}/v1/llm/v1"
+
+
 def resolve_base_url(provider=None) -> str:
     provider = provider or resolve_provider()
     configured = (
         os.environ.get("PIXIO_AGENT_BASE_URL")
         or _read_config().get("base_url" if provider != "openrouter" else "openrouter_base_url")
         or DEFAULT_BASE_URLS[provider]
-    ).strip()
-    return configured.rstrip("/")
+    ).strip().rstrip("/")
+    if provider == "machine":
+        return _normalize_gateway_url(configured)
+    return configured
 
 
 def _config_key_field(provider: str) -> str:
@@ -304,6 +329,10 @@ async def pixio_agent_set_config(request):
 # ---------------------------------------------------------------------------
 
 _MODEL_CACHE = {"at": 0.0, "models": [], "provider": None}
+# Some models reject `temperature` outright — Claude Sonnet 5 among them, which
+# is a 400 and a dead agent rather than a warning. The catalog says which, so
+# remember it as we go and simply do not send the parameter to those.
+_MODEL_CAPS = {}
 _MODEL_TTL = 1800
 
 
@@ -346,6 +375,12 @@ async def pixio_agent_openrouter_models(request):
                     raise RuntimeError(f"{url} returned {resp.status}")
                 data = await resp.json()
     except Exception as e:  # noqa: BLE001 — the UI falls back to a text field
+        detail = str(e)
+        if "401" in detail or "403" in detail:
+            detail += " — the key is missing or not valid for this endpoint"
+        elif "404" in detail:
+            detail += f" — check the endpoint; the default is {DEFAULT_BASE_URLS[provider]}"
+        e = RuntimeError(detail)
         logger.warning("could not fetch the %s catalog: %s", provider, e)
         if cached:
             return web.json_response(
@@ -375,6 +410,7 @@ async def pixio_agent_openrouter_models(request):
                 continue
             cost = row.get("cost") or {}
             modalities = (row.get("modalities") or {}).get("input") or []
+            _MODEL_CAPS[model_id] = {"temperature": row.get("temperature", True)}
             models.append(
                 {
                     "id": model_id,
@@ -1041,7 +1077,10 @@ async def pixio_agent_chat(request):
     if not api_key:
         return web.json_response(
             {
-                "error": "No OpenRouter key. Set OPENROUTER_API_KEY on the machine, or save a key in the agent's settings.",
+                "error": (
+                    f"No {PROVIDER_LABELS.get(resolve_provider(), 'provider')} key. "
+                    "Save one in the agent's settings, or set the key as a machine environment variable."
+                ),
                 "code": "no_api_key",
             },
             status=503,
@@ -1073,11 +1112,23 @@ async def pixio_agent_chat(request):
         "tool_choice": "auto",
         "parallel_tool_calls": False,
         "max_tokens": int(os.environ.get("PIXIO_AGENT_MAX_TOKENS", "8000")),
-        "temperature": 0.2,
     }
+    # A low temperature suits a build agent, but 9 of the gateway's 46 models
+    # reject the parameter outright and answer 400 — Claude Sonnet 5, GPT-5.6
+    # Sol and friends. The catalog says which, learned whenever the model list
+    # is fetched. Where we have not learned it yet, leave the parameter out:
+    # the provider default costs a little determinism, sending it costs the
+    # whole request. OpenRouter normalises this itself, so it keeps the hint.
+    caps = _MODEL_CAPS.get(model)
+    if caps.get("temperature") if caps else provider == "openrouter":
+        payload["temperature"] = 0.2
     if provider == "openrouter":
-        # OpenRouter-only: inline usage accounting on the final chunk
+        # OpenRouter's own spelling for usage on the final chunk
         payload["usage"] = {"include": True}
+    else:
+        # the OpenAI-standard spelling, which Machine honours — without it the
+        # stream carries no token counts and the panel shows no usage at all
+        payload["stream_options"] = {"include_usage": True}
 
     response = web.StreamResponse(
         headers={
@@ -1114,7 +1165,7 @@ async def pixio_agent_chat(request):
                         text = (json.loads(text).get("error") or {}).get("message") or text
                     except Exception:  # noqa: BLE001
                         pass
-                    await response.write(_sse({"type": "error", "message": f"OpenRouter {upstream.status}: {text[:400]}"}))
+                    await response.write(_sse({"type": "error", "message": f"{PROVIDER_LABELS.get(provider, provider)} {upstream.status}: {text[:400]}"}))
                     await response.write_eof()
                     return response
 

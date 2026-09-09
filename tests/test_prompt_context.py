@@ -153,7 +153,7 @@ class ProviderConfigTests(unittest.TestCase):
             "_config_dirs", "_config_path_for_write", "_config_path_for_read",
             "config_storage", "_read_config", "_write_config", "resolve_provider",
             "resolve_base_url", "_config_key_field", "resolve_api_key", "key_from_env",
-            "resolve_model",
+            "resolve_model", "_normalize_gateway_url",
         }
         names = {"PROVIDERS", "DEFAULT_BASE_URLS", "PERSISTENT_CONFIG_DIR", "DEFAULT_MODEL"}
         body = [n for n in tree.body
@@ -212,7 +212,8 @@ class MachineCatalogTests(unittest.TestCase):
         end = source.index("    models.sort(", start)
         body = ("def build(data, provider, _wants_tools=lambda m: True):\n"
                 + source[start:end] + "    return models\n")
-        self.ns = {}
+        # the builder records per-model capabilities as it goes
+        self.ns = {"_MODEL_CAPS": {}}
         exec(compile(body, "agent_routes.py", "exec"), self.ns)
 
     def test_routed_duplicates_are_dropped_because_they_cannot_run(self):
@@ -254,3 +255,62 @@ class MachineCatalogTests(unittest.TestCase):
         out = self.ns["build"](data, "openrouter")
         self.assertEqual(out[0]["id"], "x/y")
         self.assertTrue(out[0]["vision"])
+
+
+class GatewayUrlTests(unittest.TestCase):
+    """Whatever shape of the gateway URL someone pastes, requests must land."""
+
+    def setUp(self):
+        source = (ROOT / "agent_routes.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        body = [n for n in tree.body
+                if (isinstance(n, ast.FunctionDef) and n.name == "_normalize_gateway_url")
+                or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "DEFAULT_BASE_URLS")]
+        self.ns = {}
+        exec(compile(ast.Module(body=body, type_ignores=[]), "agent_routes.py", "exec"), self.ns)
+
+    def test_every_documented_shape_resolves_to_the_working_path(self):
+        # the docs give the base as .../v1/llm while the endpoint reads
+        # /v1/chat/completions, so people paste all of these
+        want = "https://machineapi.myapps.ai/v1/llm/v1"
+        for given in [
+            "https://machineapi.myapps.ai",
+            "https://machineapi.myapps.ai/v1",       # what actually 502'd
+            "https://machineapi.myapps.ai/v1/llm",
+            "https://machineapi.myapps.ai/v1/llm/v1",
+            "https://machineapi.myapps.ai/v1/llm/v1/",
+        ]:
+            self.assertEqual(self.ns["_normalize_gateway_url"](given), want, given)
+
+    def test_another_openai_compatible_host_is_never_rewritten(self):
+        for given in ["http://localhost:1234/v1", "https://api.openai.com/v1"]:
+            self.assertEqual(self.ns["_normalize_gateway_url"](given), given)
+
+
+class TemperatureCapabilityTests(unittest.TestCase):
+    """9 of the gateway's 46 models answer 400 if sent a temperature."""
+
+    def setUp(self):
+        import textwrap
+        src = (ROOT / "agent_routes.py").read_text(encoding="utf-8")
+        i = src.index("    caps = _MODEL_CAPS.get(model)")
+        j = src.index('payload["temperature"] = 0.2', i) + len('payload["temperature"] = 0.2')
+        self.snippet = textwrap.dedent(src[i:j])
+
+    def decide(self, provider, caps, model="claude-sonnet-5"):
+        ns = {"_MODEL_CAPS": caps, "model": model, "provider": provider, "payload": {}}
+        exec(self.snippet, ns)
+        return "temperature" in ns["payload"]
+
+    def test_a_model_that_rejects_temperature_is_never_sent_one(self):
+        self.assertFalse(self.decide("machine", {"claude-sonnet-5": {"temperature": False}}))
+
+    def test_a_model_that_accepts_it_still_gets_the_determinism(self):
+        self.assertTrue(self.decide("machine", {"claude-sonnet-5": {"temperature": True}}))
+
+    def test_unknown_capability_omits_it_rather_than_risking_the_request(self):
+        # the picker may not have been opened yet, so nothing has been learned
+        self.assertFalse(self.decide("machine", {}))
+
+    def test_openrouter_keeps_its_hint_because_it_normalises_upstream(self):
+        self.assertTrue(self.decide("openrouter", {}))
