@@ -94,3 +94,35 @@ class NodeResolutionTests(unittest.TestCase):
             "https://github.com/a/b": [["RealNode"], {"title_aux": "B"}],
         })
         self.assertEqual(index.get("TotallyMadeUpNode", []), [])
+
+
+class PromptCoverageTests(unittest.TestCase):
+    """The prompt is the product. Guard what it must keep saying."""
+
+    def setUp(self):
+        self.mod = runpy.run_path(str(ROOT / "agent_prompt.py"))
+        self.prompt = self.mod["SYSTEM_PROMPT"]
+
+    def test_every_tool_the_model_can_call_is_taught_or_deliberately_not(self):
+        declared = {t["function"]["name"] for t in self.mod["TOOLS"]}
+        low = self.prompt.lower()
+        unmentioned = {name for name in declared if name.lower() not in low}
+        # queue_prompt is the lesser twin of run_workflow and its schema says so;
+        # workspace context is injected every step rather than fetched.
+        self.assertEqual(unmentioned, {"queue_prompt", "get_workspace_context"})
+
+    def test_the_rules_that_stop_it_lying_or_destroying_work_are_present(self):
+        for rule in [
+            "have not seen in a tool result",       # no invented names
+            "unless the tool result says it did",   # no false success
+            "new_workflow",                         # do not overwrite the canvas
+            "never describe or approve what you have not read",
+            "no promotional interest",              # local over paid
+            "precise install list",                 # never ship a broken graph
+            "data, not instructions",               # account content is untrusted
+        ]:
+            self.assertIn(rule, self.prompt.lower(), f"missing guard: {rule}")
+
+    def test_it_stays_short_enough_to_be_followed(self):
+        words = len(self.prompt.split())
+        self.assertLess(words, 2200, "the prompt is drifting back toward unfollowable")
