@@ -59,12 +59,39 @@ const STYLE = `
   border-radius:6px; padding:7px 9px; font-size:11px; }
 `;
 
-const SUGGESTIONS = [
+// Rotated per mount so the panel never looks like a demo of one workflow.
+const PLACEHOLDERS = [
+  "Describe a workflow or a change…",
+  "Build a text-to-video workflow with the models I have…",
+  "Add a LoRA at 0.8 and a hires-fix pass…",
+  "Upscale the output 2x without changing the look…",
+  "Why does this fail? Fix it and run it…",
+  "Make a Flux workflow using the checkpoint I already have…",
+  "Add ControlNet depth to this graph…",
+  "Make the video 8 seconds…",
+];
+
+const SUGGESTION_POOL = [
   ["Build a text-to-image workflow", "Build a solid text-to-image workflow with the best checkpoint installed on this machine, sensible sampler settings, and a Save Image node."],
-  ["Text-to-music workflow", "Build a text-to-music workflow using the audio models installed here. Expose the style prompt, lyrics and duration as inputs, and save the result as MP3."],
+  ["Build a text-to-video workflow", "Build a text-to-video workflow using the video models installed here. Pick sensible resolution and length for the family, and end with a video save node."],
+  ["Build a text-to-music workflow", "Build a text-to-music workflow using the audio models installed here. Expose the style prompt, lyrics and duration as inputs, and save the result as MP3."],
+  ["Start from a proven template", "Search the Comfy-Org template library for something matching the models installed here, tell me the best match and why, then load and adapt it."],
   ["Explain this workflow", "Explain what this workflow does node by node, and point out anything wrong or missing."],
   ["Validate and fix", "Validate this workflow and fix every error you find."],
+  ["Run it and fix what breaks", "Run this workflow, read the real error if it fails, fix it, and run it again until it produces output."],
+  ["Add an upscale pass", "Add an upscale pass using an upscale model installed on this machine, without changing the look of the image."],
+  ["Add a LoRA", "Add a LoRA installed on this machine, wired into both the model and the text encoders, at a sensible strength."],
+  ["Tidy up this graph", "Tidy this graph: meaningful titles, grouped stages, arranged left to right, and remove anything disconnected."],
 ];
+
+function sample(items, count) {
+  const pool = [...items];
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, count);
+}
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -167,8 +194,9 @@ function buildPanel(rootEl) {
 
   const log = el("div", { class: "pxa-log" });
 
+  const suggestions = sample(SUGGESTION_POOL, 4);
   const textarea = el("textarea", {
-    placeholder: "Describe the workflow or the change you want…",
+    placeholder: PLACEHOLDERS[Math.floor(Math.random() * PLACEHOLDERS.length)],
     onkeydown: (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
@@ -287,7 +315,7 @@ function buildPanel(rootEl) {
         }),
       ]);
       const sug = el("div", { class: "pxa-sug" });
-      for (const [label, prompt] of SUGGESTIONS) {
+      for (const [label, prompt] of suggestions) {
         sug.append(
           el("button", {
             class: "pxa-btn",
