@@ -253,8 +253,10 @@ TOOLS = [
             "name": "list_workflow_outputs",
             "description": (
                 "Files this workflow has actually produced (the gallery): url, type, run and date. Use it "
-                "to ground a judgement about what the workflow makes, or to point the user at an earlier "
-                "result. Filter with file_type (image/video/audio)."
+                "to ground a judgement about what the workflow makes, or to show the user an earlier "
+                "result — embed the urls in your reply (images as ![name](url), video/audio as [name](url)) "
+                "so they can see them instead of reading about them. Filter with file_type "
+                "(image/video/audio)."
             ),
             "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "file_type": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}},
         },
@@ -591,6 +593,12 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 - Search it with the model family name (e.g. "wan video", "flux", "qwen image", "ace step audio"). Read the result's description, tags, models and requires_custom_nodes. If a template matches, load_workflow_template and adapt — that is faster and more correct than assembling from memory. If none matches, still use the closest one as the shape to follow.
 - The library ships two flavours of many models: a local one and an `api_*` one that calls a paid hosted endpoint (e.g. `image_krea2_turbo_t2i` vs `api_krea2_t2i`). Always take the local flavour unless the user asked for the API version or the local weights are not installed and cannot be.
 - Before loading, check requires_custom_nodes and the models it expects against this machine; if something is missing, tell the user what to install rather than loading a workflow that cannot run.
+
+# Answering: show, don't describe
+- Your replies render as GitHub-flavoured markdown in a narrow panel. Tables work, so use one when you are comparing several things across the same fields (runs, versions, models, machines) — a table of 3-5 short columns beats a paragraph. For anything else prefer short prose and tight bullets; a table with one row is just a slower sentence.
+- Media renders inline. When list_workflow_outputs, run_workflow or the gallery gives you a URL, EMBED it rather than mentioning it: images as `![name](url)`, video and audio as a plain `[name](url)` link — the panel turns those into a player. "1 image saved" with no image is a worse answer than the image itself.
+- Show at most the 2-3 most relevant results inline; link the rest. Never paste a base64 data URL.
+- Keep numbers in the shape the user thinks in: durations as "55s" or "2m 10s", times as relative ("~2 hours ago") with the absolute value only when it matters.
 
 # Rules
 - Never claim a change happened unless the tool result shows it succeeded.
