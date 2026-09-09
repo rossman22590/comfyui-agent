@@ -49,3 +49,48 @@ class PromptContextTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NodeResolutionTests(unittest.TestCase):
+    """The class-name -> repository index behind check_nodes_available."""
+
+    def setUp(self):
+        tree = ast.parse((ROOT / "agent_routes.py").read_text(encoding="utf-8"))
+        # the route itself needs aiohttp and a running ComfyUI; the index build
+        # is pure and is where a mistake would silently mislead the user
+        source = (ROOT / "agent_routes.py").read_text(encoding="utf-8")
+        start = source.index("    index = {}\n    for repo_url, entry in (data or {}).items():")
+        end = source.index('    _NODE_MAP_CACHE.update(', start)
+        body = "def build_index(data):\n" + source[start:end] + "    return index\n"
+        self.ns = {}
+        exec(compile(body, "agent_routes.py", "exec"), self.ns)
+
+    def test_index_maps_every_class_name_to_its_pack(self):
+        index = self.ns["build_index"]({
+            "https://github.com/kijai/ComfyUI-WanVideoWrapper": [
+                ["WanVideoSampler", "WanVideoDecode"],
+                {"title_aux": "ComfyUI-WanVideoWrapper"},
+            ],
+            # a second pack shipping the same class must not be lost
+            "https://github.com/someone/WanAnimatePlus": [
+                ["WanVideoSampler"],
+                {"title_aux": "ComfyUI-WanAnimatePlus"},
+            ],
+            # no title_aux: fall back to the repository name
+            "https://github.com/x/ComfyUI-Odd": [["OddNode"], {}],
+            # malformed entries must be skipped, not crash the index
+            "https://github.com/x/broken": "not-a-list",
+            "https://github.com/x/empty": [],
+        })
+        self.assertEqual(len(index["WanVideoSampler"]), 2)
+        self.assertEqual(index["WanVideoSampler"][0]["url"],
+                         "https://github.com/kijai/ComfyUI-WanVideoWrapper")
+        self.assertEqual(index["WanVideoDecode"][0]["name"], "ComfyUI-WanVideoWrapper")
+        self.assertEqual(index["OddNode"][0]["name"], "ComfyUI-Odd")
+        self.assertNotIn("not-a-list", index)
+
+    def test_an_unknown_name_has_no_provider_so_no_url_is_invented(self):
+        index = self.ns["build_index"]({
+            "https://github.com/a/b": [["RealNode"], {"title_aux": "B"}],
+        })
+        self.assertEqual(index.get("TotallyMadeUpNode", []), [])

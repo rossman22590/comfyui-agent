@@ -38,6 +38,10 @@ agent requests, which run on your machine using its OpenRouter key.
   iframe.
 - **It works on what you point at.** Right-click any node → *Ask the agent about
   this node* / *Agent: change this node…*
+- **It tells you what to install.** When a workflow needs a node this machine
+  does not have, it names the pack and its GitHub URL (from the ComfyUI-Manager
+  index) instead of building a graph that fails on Run — and offers the best
+  workflow it can build from what you do have.
 - **It never eats your work.** Asking for a *new* workflow opens a new tab; the
   canvas you have open is not cleared. Batched edits are one Undo.
 - **It remembers, and it forgets on purpose.** The conversation survives an
@@ -105,7 +109,7 @@ until the model is done.
 | File | Role |
 | --- | --- |
 | `agent_prompt.py` | System prompt — ComfyUI ground truth, pipeline recipes, working procedure — plus the tool schemas |
-| `agent_routes.py` | `chat` (SSE), `models`, `templates`, `template`, `validate`, `config`, `ping` |
+| `agent_routes.py` | `chat` (SSE), `models`, `templates`, `template`, `resolve-nodes`, `validate`, `config`, `ping` |
 | `web/agent-graph.js` | Graph read/edit/run core — the tool implementations |
 | `web/agent-runtime.js` | Agent loop, conversation state, persistence, host bridge, canvas menus |
 | `web/agent-sidebar.js` | The built-in chat UI (hidden when embedded in a host app) |
@@ -115,7 +119,8 @@ until the model is done.
 `get_graph` · `find_in_graph` · `search_node_types` · `get_node_type_details` ·
 `new_workflow` · `list_models` ·
 `list_pixio_models` · `list_workflow_templates` · `load_workflow_template` ·
-`apply_graph_ops` · `validate_workflow` · `run_workflow` · `focus_node` ·
+`check_nodes_available` · `apply_graph_ops` · `validate_workflow` ·
+`run_workflow` · `list_queue` · `run_history` · `interrupt_run` · `focus_node` ·
 `queue_prompt`
 
 Host-provided (only when embedded in an app that answers them):

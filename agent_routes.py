@@ -228,6 +228,114 @@ async def pixio_agent_models(request):
 
 
 # ---------------------------------------------------------------------------
+# is this node type available here, and if not, who ships it?
+# ---------------------------------------------------------------------------
+#
+# ComfyUI-Manager publishes the canonical class-name -> repository map. We
+# reverse it once so a missing node type becomes an actionable answer ("this
+# comes from X, add it to the machine") instead of a dead end.
+
+NODE_MAP_URL = (
+    "https://raw.githubusercontent.com/Comfy-Org/ComfyUI-Manager/main/extension-node-map.json"
+)
+_NODE_MAP_CACHE = {"at": 0.0, "index": None}
+_NODE_MAP_TTL = 21600
+
+
+async def _node_provider_index():
+    now = time.time()
+    if _NODE_MAP_CACHE["index"] is not None and now - _NODE_MAP_CACHE["at"] < _NODE_MAP_TTL:
+        return _NODE_MAP_CACHE["index"]
+    try:
+        timeout = aiohttp.ClientTimeout(total=45, connect=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(NODE_MAP_URL) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"node map returned {resp.status}")
+                # raw.githubusercontent serves JSON as text/plain
+                data = json.loads(await resp.text())
+    except Exception as e:  # noqa: BLE001 — offline machines still answer "missing"
+        logger.warning("could not fetch the custom-node map: %s", e)
+        return _NODE_MAP_CACHE["index"]
+
+    index = {}
+    for repo_url, entry in (data or {}).items():
+        if not isinstance(entry, list) or not entry:
+            continue
+        names = entry[0] if isinstance(entry[0], list) else []
+        meta = entry[1] if len(entry) > 1 and isinstance(entry[1], dict) else {}
+        title = meta.get("title_aux") or repo_url.rstrip("/").split("/")[-1]
+        for name in names:
+            index.setdefault(str(name), []).append({"name": title, "url": repo_url})
+    _NODE_MAP_CACHE.update({"at": now, "index": index})
+    return index
+
+
+def _installed_node_types():
+    try:
+        import nodes as comfy_nodes
+
+        return comfy_nodes.NODE_CLASS_MAPPINGS
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+@routes.post("/pixio-agent/resolve-nodes")
+async def pixio_agent_resolve_nodes(request):
+    """Split requested node types into installed vs missing, with providers."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    types = body.get("types") if isinstance(body, dict) else None
+    if not isinstance(types, list) or not types:
+        return web.json_response({"error": "`types` (a list of node class names) is required"}, status=400)
+
+    installed_map = _installed_node_types()
+    display_index = {}
+    for class_name, cls in installed_map.items():
+        display = getattr(cls, "DISPLAY_NAME", None)
+        if display:
+            display_index.setdefault(str(display).lower(), class_name)
+
+    wanted = [str(t) for t in types[:100]]
+    missing_names = [t for t in wanted if t not in installed_map]
+    providers = await _node_provider_index() if missing_names else {}
+
+    installed, missing = [], []
+    for name in wanted:
+        if name in installed_map:
+            installed.append({"type": name, "resolved_from": None})
+            continue
+        # the model may have written a menu label rather than the class name
+        alias = display_index.get(name.lower())
+        if alias:
+            installed.append({"type": alias, "resolved_from": name})
+            continue
+        entry = {"type": name}
+        if providers is None:
+            entry["provided_by"] = None
+            entry["note"] = "the custom-node index could not be reached from this machine"
+        else:
+            entry["provided_by"] = providers.get(name, [])[:3]
+        missing.append(entry)
+
+    return web.json_response(
+        {
+            "installed": installed,
+            "missing": missing,
+            "all_available": not missing,
+            "machine_node_types": len(installed_map),
+            "note": (
+                "Missing types cannot be installed from here: the user adds the repository to the "
+                "machine's custom nodes and rebuilds."
+            ),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # workflow templates (core + custom nodes)
 # ---------------------------------------------------------------------------
 

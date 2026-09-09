@@ -1501,6 +1501,27 @@ TOOL_IMPL.interrupt_run = async () => interruptRun();
 TOOL_IMPL.run_history = async (args) => runHistory(args);
 MUTATING_TOOLS.add("interrupt_run");
 
+/**
+ * Which of these node types exist on this machine, and where do the rest come
+ * from. Turns "unknown node type" into a shopping list the user can act on.
+ */
+async function checkNodesAvailable({ types = [] } = {}) {
+  const wanted = (Array.isArray(types) ? types : [types]).filter(Boolean);
+  if (!wanted.length) throw new Error("check_nodes_available requires `types`");
+  const res = await fetch("/pixio-agent/resolve-nodes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ types: wanted }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error ?? `could not resolve node types (${res.status})`);
+  }
+  return res.json();
+}
+
+TOOL_IMPL.check_nodes_available = async (args) => checkNodesAvailable(args);
+
 TOOL_IMPL.find_in_graph = async (args) => findInGraph(args);
 TOOL_IMPL.new_workflow = async (args) => newWorkflow(args);
 MUTATING_TOOLS.add("new_workflow");
