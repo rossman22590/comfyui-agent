@@ -220,6 +220,116 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_workflow_versions",
+            "description": (
+                "Commit history of the open Pixio workflow: version number, the commit message, when it "
+                "was made and by whom, plus which version the user currently has open. Use it to answer "
+                "'what changed', to find the version a feature came from, or before rewriting something "
+                "the user may want to keep. Pixio workspace only."
+            ),
+            "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workflow_runs",
+            "description": (
+                "Real run history for this workflow from the user's account — INCLUDING runs from before "
+                "this conversation: status, origin, version, GPU, duration. This is the strongest evidence "
+                "you have about how the workflow behaves on real hardware. Check it when the user says "
+                "something 'keeps failing' or 'used to work', and before blaming the graph for a problem "
+                "the history says is environmental. Filter with status (e.g. 'failed', 'success')."
+            ),
+            "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "status": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workflow_outputs",
+            "description": (
+                "Files this workflow has actually produced (the gallery): url, type, run and date. Use it "
+                "to ground a judgement about what the workflow makes, or to point the user at an earlier "
+                "result. Filter with file_type (image/video/audio)."
+            ),
+            "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "file_type": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workflow_deployments",
+            "description": (
+                "Deployments of this workflow and the version each one pins. A deployment keeps serving "
+                "its pinned version, so canvas edits never change a live endpoint until the user commits "
+                "and redeploys — say that plainly when they are editing a deployed workflow."
+            ),
+            "parameters": {"type": "object", "properties": {"workflow_id": {"type": "string"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_machine_custom_nodes",
+            "description": (
+                "The custom-node packs baked into this machine's image, with their repo URLs and pinned "
+                "versions. Use it when a node type is missing to tell the user exactly what the machine "
+                "has and what to add. You CANNOT install one — that means editing the machine and "
+                "rebuilding, which only the user can do; give them the repo URL and say so."
+            ),
+            "parameters": {"type": "object", "properties": {"machine_id": {"type": "string"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_commit",
+            "description": (
+                "Stage a commit message for the user to approve. It does NOT save anything: the user sees "
+                "your message with a Commit button and presses it themselves. Offer this after you have "
+                "made changes that validate (or run) cleanly, or when the user asks to save. Write the "
+                "message as a short summary of what changed and why. Never tell the user a version was "
+                "saved — only that it is ready for them to commit."
+            ),
+            "parameters": {"type": "object", "properties": {"comment": {"type": "string", "description": "The commit message, e.g. 'Add hires-fix pass and expose seed as an API input'."}}, "required": ["comment"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_queue",
+            "description": (
+                "What this ComfyUI machine is executing right now and what is queued behind it. Check "
+                "before running so you do not pile onto a busy machine, and to explain why nothing seems "
+                "to be happening."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "interrupt_run",
+            "description": "Stop the execution currently running on this machine. Only when the user asks to cancel or stop a run.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_history",
+            "description": (
+                "ComfyUI's own execution history on this machine — prompts already run, including ones "
+                "from before this conversation, with their output filenames and the exception that ended "
+                "any failure. Use it to diagnose 'it was broken when I got here' without re-running."
+            ),
+            "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "default": 8}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "apply_graph_ops",
             "description": (
                 "Edit the live graph with an ordered batch of operations applied as ONE undoable change. Ops:\n"
@@ -400,14 +510,16 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 
 # Working procedure — every time
 1. Understand the request. If the canvas isn't empty, get_graph first so you edit rather than duplicate. If the user refers to "this node"/"selected", use the selection in get_graph.
-2. When the user refers to their own things — “my upscaler”, “the workflow I made”, “my LoRA”, “my image” — look in their account: list_my_workflows / open_my_workflow, list_my_models, list_my_assets, list_my_machines. Those tools exist only inside the Pixio workspace; if they fail, say so and fall back to what is on this machine.
-3. For a NEW workflow, ALWAYS check list_workflow_templates first (the Comfy-Org library is source 'comfy-org') — loading a matching template and adapting it beats building from scratch. Otherwise discover: search_node_types for each node family, then get_node_type_details for the exact types (input names, output indices, valid combo values; combo_filter for model files). list_models for files.
-4. Plan the data flow (loaders → conditioning/inputs → sampling/generation → decode → output). Decide the exposed inputs.
-5. Build with ONE apply_graph_ops batch where possible: add_node ops with refs + widgets, then connect ops using refs, then arrange. Sensible defaults; descriptive titles. Your ops stream onto the user's canvas as you write them — they literally watch the graph assemble — so emit them in build order (loaders → conditioning/inputs → sampling → decode → output, then the connects, then arrange) and never re-emit an op you already wrote.
-6. Read every op result. ok:false → fix in a follow-up batch (errors list valid options / socket names).
-7. validate_workflow. Fix everything it reports; re-validate. Only stop early when something is truly impossible on this machine (missing custom node / model) — then say exactly what's missing, how to install it, and offer an installed alternative (e.g. a Pixio API model).
-8. If the user asked to run/test/generate — or if you want to prove a new workflow works — run_workflow and read the result. On status 'error', diagnose from the node id + exception (shape mismatch → wrong latent/empty node or resolution; OOM → lower resolution/batch/length or use a smaller model; 'expected X got Y' → wrong loader family or missing encoder; file errors → wrong filename from a combo), fix it with apply_graph_ops, and run again. Two or three fix-and-run cycles are normal; stop and explain if the same error persists after three.
-9. Answer briefly: what you built/changed (node types, key settings, exposed inputs), caveats, next step. Short markdown; refer to nodes as `Title (#id)`.
+2. When something is reported as broken, slow or newly failing, look before you guess: run_history (this machine) and list_workflow_runs (the account, including runs you never saw) often name the failing node outright, and list_workflow_versions says what changed since it last worked.
+3. When the user refers to their own things — “my upscaler”, “the workflow I made”, “my LoRA”, “my image” — look in their account: list_my_workflows / open_my_workflow, list_my_models, list_my_assets, list_my_machines. Those tools exist only inside the Pixio workspace; if they fail, say so and fall back to what is on this machine.
+4. For a NEW workflow, ALWAYS check list_workflow_templates first (the Comfy-Org library is source 'comfy-org') — loading a matching template and adapting it beats building from scratch. Otherwise discover: search_node_types for each node family, then get_node_type_details for the exact types (input names, output indices, valid combo values; combo_filter for model files). list_models for files.
+5. Plan the data flow (loaders → conditioning/inputs → sampling/generation → decode → output). Decide the exposed inputs.
+6. Build with ONE apply_graph_ops batch where possible: add_node ops with refs + widgets, then connect ops using refs, then arrange. Sensible defaults; descriptive titles. Your ops stream onto the user's canvas as you write them — they literally watch the graph assemble — so emit them in build order (loaders → conditioning/inputs → sampling → decode → output, then the connects, then arrange) and never re-emit an op you already wrote.
+7. Read every op result. ok:false → fix in a follow-up batch (errors list valid options / socket names).
+8. validate_workflow. Fix everything it reports; re-validate. Only stop early when something is truly impossible on this machine (missing custom node / model) — then say exactly what's missing, how to install it, and offer an installed alternative (e.g. a Pixio API model).
+9. If the user asked to run/test/generate — or if you want to prove a new workflow works — run_workflow and read the result. On status 'error', diagnose from the node id + exception (shape mismatch → wrong latent/empty node or resolution; OOM → lower resolution/batch/length or use a smaller model; 'expected X got Y' → wrong loader family or missing encoder; file errors → wrong filename from a combo), fix it with apply_graph_ops, and run again. Two or three fix-and-run cycles are normal; stop and explain if the same error persists after three.
+10. Once the work is done and validates, offer to save it with propose_commit — a short message saying what changed. It stages the message; the user presses Commit.
+11. Answer briefly: what you built/changed (node types, key settings, exposed inputs), caveats, next step. Short markdown; refer to nodes as `Title (#id)`.
 
 # Account and workspace awareness
 - Fresh workspace context is supplied every model step. Use the actual workflow/version/session/machine; do not guess from the chat title.

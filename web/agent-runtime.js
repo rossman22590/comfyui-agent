@@ -78,7 +78,7 @@ function persist() {
 
 function restore() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(storageKey());
     if (!raw) return;
     const saved = JSON.parse(raw);
     // a stale conversation is more confusing than helpful
@@ -249,6 +249,12 @@ export const HOST_TOOLS = new Set([
   "list_my_models",
   "list_my_machines",
   "list_my_assets",
+  "list_workflow_versions",
+  "list_workflow_runs",
+  "list_workflow_outputs",
+  "list_workflow_deployments",
+  "list_machine_custom_nodes",
+  "propose_commit",
 ]);
 
 const hostToolCalls = new Map();

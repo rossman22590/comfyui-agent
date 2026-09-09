@@ -1419,6 +1419,88 @@ async function newWorkflow({ title, workflow } = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// the queue and what already ran on this machine
+// ---------------------------------------------------------------------------
+
+/** What ComfyUI is working on right now, and what is waiting. */
+async function listQueue() {
+  const res = await fetch("/queue");
+  if (!res.ok) throw new Error(`could not read the queue (${res.status})`);
+  const data = await res.json();
+  const describe = (entry) => {
+    const prompt = Array.isArray(entry) ? entry[2] : entry;
+    const nodes = prompt && typeof prompt === "object" ? Object.entries(prompt) : [];
+    return {
+      prompt_id: Array.isArray(entry) ? entry[1] : undefined,
+      node_count: nodes.length,
+      outputs: nodes
+        .filter(([, node]) => /save|preview|output/i.test(node?.class_type ?? ""))
+        .map(([, node]) => node.class_type),
+    };
+  };
+  return {
+    running: (data.queue_running ?? []).map(describe),
+    pending: (data.queue_pending ?? []).map(describe),
+    busy: (data.queue_running ?? []).length > 0,
+  };
+}
+
+/** Stop the current execution. */
+async function interruptRun() {
+  const res = await fetch("/interrupt", { method: "POST" });
+  if (!res.ok) throw new Error(`could not interrupt (${res.status})`);
+  return { interrupted: true };
+}
+
+/**
+ * ComfyUI's own history: prompts already executed on this machine, including
+ * ones the user ran before this conversation started, with their outputs and
+ * any error that ended them.
+ */
+async function runHistory({ limit = 8 } = {}) {
+  const count = Math.min(Math.max(Number(limit) || 8, 1), 50);
+  const res = await fetch(`/history?max_items=${count}`);
+  if (!res.ok) throw new Error(`could not read history (${res.status})`);
+  const data = await res.json();
+
+  const entries = Object.entries(data).slice(-count).reverse();
+  return {
+    total_returned: entries.length,
+    runs: entries.map(([promptId, entry]) => {
+      const status = entry?.status ?? {};
+      const messages = status.messages ?? [];
+      const error = messages.find(([kind]) => kind === "execution_error")?.[1];
+      const files = [];
+      for (const output of Object.values(entry?.outputs ?? {})) {
+        for (const key of ["images", "audio", "video", "gifs"]) {
+          for (const item of output?.[key] ?? []) {
+            if (item?.filename) files.push(item.filename);
+          }
+        }
+      }
+      return {
+        prompt_id: promptId,
+        status: status.status_str ?? (status.completed ? "success" : "unknown"),
+        completed: !!status.completed,
+        outputs: files.slice(0, 8),
+        error: error
+          ? {
+              node_id: error.node_id,
+              node_type: error.node_type,
+              message: error.exception_message ?? error.exception_type,
+            }
+          : undefined,
+      };
+    }),
+  };
+}
+
+TOOL_IMPL.list_queue = async () => listQueue();
+TOOL_IMPL.interrupt_run = async () => interruptRun();
+TOOL_IMPL.run_history = async (args) => runHistory(args);
+MUTATING_TOOLS.add("interrupt_run");
+
 TOOL_IMPL.find_in_graph = async (args) => findInGraph(args);
 TOOL_IMPL.new_workflow = async (args) => newWorkflow(args);
 MUTATING_TOOLS.add("new_workflow");
