@@ -1232,6 +1232,16 @@ export function graphSummary(limit = 60) {
 // or the produced outputs. Runtime errors are things validation cannot catch —
 // shape mismatches, OOM, a model that rejects its conditioning.
 
+/** What kind of thing a produced file is, by extension. */
+function mediaKind(filename) {
+  const name = String(filename).toLowerCase();
+  if (/\.(png|jpe?g|webp|gif|avif|bmp)$/.test(name)) return "image";
+  if (/\.(mp4|webm|mov|m4v|mkv|avi)$/.test(name)) return "video";
+  if (/\.(mp3|wav|flac|ogg|opus|m4a|aac)$/.test(name)) return "audio";
+  if (/\.(glb|gltf|obj|ply|stl|fbx|usdz)$/.test(name)) return "3d";
+  return "file";
+}
+
 function apiEvents() {
   // the ComfyUI api singleton lives on the app in every recent frontend
   return app.api ?? window.comfyAPI?.api?.api ?? null;
@@ -1286,10 +1296,29 @@ async function runWorkflow({ timeout_seconds = 300 } = {}) {
       const d = event.detail ?? {};
       if (promptId && d.prompt_id && d.prompt_id !== promptId) return;
       const node = app.graph.getNodeById(Number(d.node));
+      // a filename the user cannot open is not a result; build the absolute
+      // /view url so the agent can show what it just produced
       const media = [];
-      for (const key of ["images", "audio", "video", "gifs", "text"]) {
+      for (const key of ["images", "audio", "video", "gifs", "model", "mesh", "3d", "text"]) {
         for (const item of d.output?.[key] ?? []) {
-          media.push(typeof item === "string" ? item : item.filename ?? JSON.stringify(item));
+          if (typeof item === "string") {
+            media.push({ filename: item, kind: key === "text" ? "text" : mediaKind(item) });
+            continue;
+          }
+          if (!item?.filename) {
+            media.push({ value: JSON.stringify(item) });
+            continue;
+          }
+          const params = new URLSearchParams({
+            filename: item.filename,
+            type: item.type ?? "output",
+            subfolder: item.subfolder ?? "",
+          });
+          media.push({
+            filename: item.filename,
+            kind: mediaKind(item.filename),
+            url: `${location.origin}/view?${params.toString()}`,
+          });
         }
       }
       outputs[d.node] = { node_type: node?.type, files: media };
