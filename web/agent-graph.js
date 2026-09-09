@@ -238,14 +238,61 @@ function widgetOptionsValues(widget) {
   return v;
 }
 
-function linkById(id) {
-  const links = app.graph.links;
+// ---------------------------------------------------------------------------
+// subgraphs
+// ---------------------------------------------------------------------------
+//
+// A subgraph node holds an entire inner graph. Reading only app.graph makes
+// those nodes opaque — the agent could see "#405 is a subgraph" and nothing
+// inside it. Every read and every op therefore takes a `target`: "root" (the
+// default) or the id of a subgraph node, resolved to the LGraph instance that
+// node carries. The undo snapshot is still taken at the root because
+// serialize() writes subgraph contents into `definitions`.
+
+function isSubgraphNode(node) {
+  if (!node) return false;
+  if (typeof node.isSubgraphNode === "function") {
+    try {
+      if (node.isSubgraphNode()) return true;
+    } catch {
+      // older frontends: fall through to the shape check
+    }
+  }
+  const inner = node.subgraph;
+  return !!inner && (Array.isArray(inner._nodes) || Array.isArray(inner.nodes));
+}
+
+function nodesOf(graph) {
+  return graph?._nodes ?? graph?.nodes ?? [];
+}
+
+/** Resolve a `target` to a graph. Throws with a usable message when it can't. */
+function graphFor(target) {
+  if (target == null || target === "root") {
+    return { graph: app.graph, scope: "root" };
+  }
+  const id = Number(target);
+  const host = Number.isNaN(id) ? null : app.graph.getNodeById(id);
+  if (!host) {
+    throw new Error(`target "${target}" is not a node in the root graph — pass a subgraph node's id, or omit target for the root graph`);
+  }
+  if (!isSubgraphNode(host)) {
+    throw new Error(`node ${host.id} (${host.type}) is not a subgraph, so it has no inner graph to target`);
+  }
+  return {
+    graph: host.subgraph,
+    scope: { subgraph_node: host.id, name: host.title ?? host.type },
+  };
+}
+
+function linkById(id, graph = app.graph) {
+  const links = graph?.links;
   if (!links) return undefined;
   if (typeof links.get === "function") return links.get(id) ?? links.get(Number(id));
   return links[id];
 }
 
-function compactNode(node, { fullValues = false } = {}) {
+function compactNode(node, { fullValues = false, graph = app.graph } = {}) {
   const widgets = (node.widgets ?? [])
     .filter((w) => w.type !== "converted-widget" && !w.name?.startsWith("$$"))
     .map((w) => ({
@@ -257,7 +304,7 @@ function compactNode(node, { fullValues = false } = {}) {
     const entry = { index: i, name: inp.name, type: inp.type };
     if (inp.widget) entry.widget = true;
     if (inp.link != null) {
-      const link = linkById(inp.link);
+      const link = linkById(inp.link, graph);
       if (link) {
         entry.link = {
           from_node: link.origin_id,
@@ -270,7 +317,7 @@ function compactNode(node, { fullValues = false } = {}) {
   const outputs = (node.outputs ?? []).map((out, i) => {
     const targets = [];
     for (const lid of out.links ?? []) {
-      const link = linkById(lid);
+      const link = linkById(lid, graph);
       if (link) targets.push({ to_node: link.target_id, to_slot: link.target_slot });
     }
     return { index: i, name: out.name, type: out.type, links: targets };
@@ -287,6 +334,15 @@ function compactNode(node, { fullValues = false } = {}) {
     outputs,
   };
   if (node.color) result.color = node.color;
+  if (isSubgraphNode(node)) {
+    const inner = node.subgraph;
+    result.subgraph = {
+      inner_node_count: nodesOf(inner).length,
+      inputs: (inner?.inputs ?? []).map((i) => i?.name ?? i?.label).filter(Boolean),
+      outputs: (inner?.outputs ?? []).map((o) => o?.name ?? o?.label).filter(Boolean),
+      read_with: { tool: "get_graph", args: { target: node.id } },
+    };
+  }
   return result;
 }
 
@@ -295,19 +351,28 @@ function selectedNodeIds() {
   return Object.values(sel).map((n) => n.id);
 }
 
-function getGraph({ node_ids, full_values = false } = {}) {
-  const nodes = app.graph._nodes ?? app.graph.nodes ?? [];
+function getGraph({ node_ids, full_values = false, target, into } = {}) {
+  // `into` reads the same way as `target`; both name a subgraph node
+  const { graph, scope } = graphFor(into ?? target);
+  const nodes = nodesOf(graph);
   const filtered = node_ids?.length ? nodes.filter((n) => node_ids.includes(n.id)) : nodes;
-  const groups = (app.graph._groups ?? app.graph.groups ?? []).map((g) => ({
+  const groups = (graph._groups ?? graph.groups ?? []).map((g) => ({
     title: g.title,
     bounding: (g._bounding ?? g.bounding ?? []).map((v) => Math.round(v)),
   }));
-  return {
+  const result = {
+    scope,
     node_count: nodes.length,
-    selected: selectedNodeIds(),
-    nodes: filtered.map((n) => compactNode(n, { fullValues: full_values })),
+    selected: scope === "root" ? selectedNodeIds() : [],
+    nodes: filtered.map((n) => compactNode(n, { fullValues: full_values, graph })),
     groups,
   };
+  const nested = nodes.filter(isSubgraphNode).map((n) => n.id);
+  if (nested.length) {
+    result.subgraph_nodes = nested;
+    result.note = `Nodes ${nested.join(", ")} contain their own graphs — read one with get_graph({target: <id>}) and edit it by putting the same target on your ops.`;
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,12 +381,12 @@ function getGraph({ node_ids, full_values = false } = {}) {
 
 const MODE_MAP = { always: 0, mute: 2, never: 2, bypass: 4 };
 
-function resolveNode(refs, key) {
+function resolveNode(refs, key, graph = app.graph) {
   if (key == null) return null;
   if (typeof key === "string" && refs.has(key)) return refs.get(key);
   const asNum = Number(key);
   if (!Number.isNaN(asNum)) {
-    const n = app.graph.getNodeById(asNum);
+    const n = graph.getNodeById(asNum);
     if (n) return n;
   }
   return null;
@@ -441,15 +506,15 @@ function describeSlots(node) {
 }
 
 class Placer {
-  constructor() {
-    const nodes = app.graph._nodes ?? [];
+  constructor(graph = app.graph) {
+    const nodes = nodesOf(graph);
     let maxX = 0;
     let minY = 0;
     if (nodes.length) {
       maxX = Math.max(...nodes.map((n) => n.pos[0] + n.size[0]));
       minY = Math.min(...nodes.map((n) => n.pos[1]));
     } else {
-      const c = app.canvas;
+      const c = graph === app.graph ? app.canvas : null;
       if (c?.ds) {
         maxX = -c.ds.offset[0] / c.ds.scale + 80;
         minY = -c.ds.offset[1] / c.ds.scale + 120;
@@ -475,8 +540,8 @@ class Placer {
   }
 }
 
-function autoArrange() {
-  const nodes = app.graph._nodes ?? [];
+function autoArrange(graph = app.graph) {
+  const nodes = nodesOf(graph);
   if (!nodes.length) return;
   // longest-path layering from source nodes
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -639,7 +704,7 @@ function createOpsContext() {
   return {
     refs: new Map(),
     warnings: [],
-    placer: new Placer(),
+    placers: new Map(),
     results: [],
     failed: 0,
     snapshot: null,
@@ -648,10 +713,17 @@ function createOpsContext() {
 
 /** Apply a single op. Never throws — failures land in the returned result. */
 async function applyOne(op, index, ctx) {
-  const { refs, warnings, placer } = ctx;
+  const { refs, warnings } = ctx;
   const res = { index, op: op?.op, ok: true };
   op = op ?? {};
   try {
+    // ops address the root graph unless they name a subgraph node
+    const { graph, scope } = graphFor(op.target);
+    if (scope !== "root") res.target = scope;
+    // each graph gets its own layout cursor so nodes do not stack
+    const placerKey = scope === "root" ? "root" : `sub:${scope.subgraph_node}`;
+    if (!ctx.placers.has(placerKey)) ctx.placers.set(placerKey, new Placer(graph));
+    const placer = ctx.placers.get(placerKey);
     switch (op.op) {
       case "add_node": {
         if (!op.type) throw new Error("add_node requires `type`");
@@ -673,7 +745,7 @@ async function applyOne(op, index, ctx) {
           );
         }
         if (op.title) node.title = op.title;
-        app.graph.add(node);
+        graph.add(node);
         node.pos = Array.isArray(op.pos) && op.pos.length === 2 ? [Number(op.pos[0]), Number(op.pos[1])] : placer.next(node);
         if (op.widgets && typeof op.widgets === "object") {
           res.widgets = {};
@@ -696,15 +768,15 @@ async function applyOne(op, index, ctx) {
         break;
       }
       case "remove_node": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
-        app.graph.remove(node);
+        graph.remove(node);
         res.node_id = node.id;
         break;
       }
       case "set_widget":
       case "set_widgets": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
         const entries = op.widgets && typeof op.widgets === "object" ? Object.entries(op.widgets) : [[op.name, op.value]];
         res.node_id = node.id;
@@ -724,8 +796,8 @@ async function applyOne(op, index, ctx) {
       case "connect": {
         const from = op.from ?? {};
         const to = op.to ?? {};
-        const src = resolveNode(refs, from.node ?? from.node_id ?? from.ref);
-        const dst = resolveNode(refs, to.node ?? to.node_id ?? to.ref);
+        const src = resolveNode(refs, from.node ?? from.node_id ?? from.ref, graph);
+        const dst = resolveNode(refs, to.node ?? to.node_id ?? to.ref, graph);
         if (!src) throw new Error(`connect: source node not found: ${JSON.stringify(from)}`);
         if (!dst) throw new Error(`connect: target node not found: ${JSON.stringify(to)}`);
         const inIdx = findInputSlot(dst, to.input ?? to.slot ?? to.name);
@@ -743,7 +815,7 @@ async function applyOne(op, index, ctx) {
         break;
       }
       case "disconnect": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
         if (op.input !== undefined) {
           const idx = findInputSlot(node, op.input);
@@ -759,14 +831,14 @@ async function applyOne(op, index, ctx) {
         break;
       }
       case "set_title": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
         node.title = String(op.title ?? "");
         res.node_id = node.id;
         break;
       }
       case "set_mode": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
         const m = MODE_MAP[String(op.mode).toLowerCase()];
         if (m === undefined) throw new Error(`mode must be one of ${Object.keys(MODE_MAP).join(", ")}`);
@@ -776,7 +848,7 @@ async function applyOne(op, index, ctx) {
       }
       case "set_pos":
       case "move_node": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
         if (!Array.isArray(op.pos) || op.pos.length !== 2) throw new Error("set_pos requires pos:[x,y]");
         node.pos = [Number(op.pos[0]), Number(op.pos[1])];
@@ -784,7 +856,7 @@ async function applyOne(op, index, ctx) {
         break;
       }
       case "set_color": {
-        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id);
+        const node = resolveNode(refs, op.node ?? op.node_id ?? op.id, graph);
         if (!node) throw new Error(`node not found: ${op.node ?? op.node_id ?? op.id}`);
         node.color = op.color;
         if (op.bgcolor) node.bgcolor = op.bgcolor;
@@ -793,7 +865,7 @@ async function applyOne(op, index, ctx) {
       }
       case "add_group": {
         const group = new LiteGraph.LGraphGroup(op.title ?? "Group");
-        const members = (op.nodes ?? []).map((k) => resolveNode(refs, k)).filter(Boolean);
+        const members = (op.nodes ?? []).map((k) => resolveNode(refs, k, graph)).filter(Boolean);
         if (members.length) {
           const minX = Math.min(...members.map((n) => n.pos[0])) - 20;
           const minY = Math.min(...members.map((n) => n.pos[1])) - 60;
@@ -811,12 +883,12 @@ async function applyOne(op, index, ctx) {
           for (let k = 0; k < 4; k++) b[k] = Number(op.bounding[k]);
         }
         if (op.color) group.color = op.color;
-        app.graph.add(group);
+        graph.add(group);
         res.group = op.title;
         break;
       }
       case "clear_graph": {
-        app.graph.clear();
+        graph.clear();
         refs.clear();
         res.cleared = true;
         break;
@@ -825,17 +897,17 @@ async function applyOne(op, index, ctx) {
         if (!op.workflow || typeof op.workflow !== "object") throw new Error("load_graph requires `workflow` (ComfyUI workflow JSON)");
         await app.loadGraphData(op.workflow, true, false);
         refs.clear();
-        res.loaded_nodes = (app.graph._nodes ?? []).length;
+        res.loaded_nodes = nodesOf(graph).length;
         break;
       }
       case "arrange": {
-        if (typeof app.graph.arrange === "function" && op.strategy !== "layered") {
+        if (typeof graph.arrange === "function" && op.strategy !== "layered") {
           try {
-            app.graph.arrange(op.margin ?? 80);
+            graph.arrange(op.margin ?? 80);
           } catch {
-            autoArrange();
+            autoArrange(graph);
           }
-        } else autoArrange();
+        } else autoArrange(graph);
         res.arranged = true;
         break;
       }
@@ -1343,13 +1415,32 @@ export function imagesFromRun(result) {
  * On a 60-node workflow this is how "change the duration" finds the one node
  * that actually carries it, instead of guessing from a full graph dump.
  */
-function findInGraph({ query, widget, type, limit = 20 } = {}) {
+function findInGraph({ query, widget, type, limit = 20, target, include_subgraphs = true } = {}) {
   const q = query ? String(query).toLowerCase() : null;
   const wantWidget = widget ? String(widget).toLowerCase() : null;
   const wantType = type ? String(type).toLowerCase() : null;
   const hits = [];
 
-  for (const node of app.graph._nodes ?? []) {
+  // walk the targeted graph and, unless told otherwise, everything nested in it
+  const { graph: rootGraph, scope: rootScope } = graphFor(target);
+  const queue = [{ graph: rootGraph, scope: rootScope }];
+  const searched = [];
+  const candidates = [];
+  while (queue.length) {
+    const { graph, scope } = queue.shift();
+    searched.push(scope);
+    for (const node of nodesOf(graph)) {
+      candidates.push({ node, scope });
+      if (include_subgraphs && isSubgraphNode(node)) {
+        queue.push({
+          graph: node.subgraph,
+          scope: { subgraph_node: node.id, name: node.title ?? node.type },
+        });
+      }
+    }
+  }
+
+  for (const { node, scope } of candidates) {
     if (wantType && !String(node.type).toLowerCase().includes(wantType)) continue;
 
     const matchedWidgets = [];
@@ -1372,6 +1463,8 @@ function findInGraph({ query, widget, type, limit = 20 } = {}) {
     if (matchedWidgets.length || nodeHit || (wantType && !q && !wantWidget)) {
       hits.push({
         id: node.id,
+        scope,
+        target: scope === "root" ? undefined : scope.subgraph_node,
         type: node.type,
         title: node.title,
         mode: node.mode === 4 ? "bypass" : node.mode === 2 ? "mute" : "always",
@@ -1380,7 +1473,15 @@ function findInGraph({ query, widget, type, limit = 20 } = {}) {
       });
     }
   }
-  return { total: hits.length, nodes: hits.slice(0, limit) };
+  return {
+    total: hits.length,
+    searched_graphs: searched.length,
+    nodes: hits.slice(0, limit),
+    note:
+      searched.length > 1
+        ? "A hit with `target` set lives inside that subgraph — repeat the target on any op that edits it."
+        : undefined,
+  };
 }
 
 /**

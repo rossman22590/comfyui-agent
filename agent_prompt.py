@@ -21,6 +21,8 @@ TOOLS = [
                 "(bypass/mute), widget values (long strings truncated unless full_values), input "
                 "sockets with their incoming link (from_node/from_slot), output sockets with "
                 "outgoing links, groups, and the ids of nodes the user currently has selected. "
+                "A node that contains its own graph is marked with `subgraph` (inner node count "
+                "and exposed inputs/outputs); read inside it with target=<that node's id>. "
                 "Call it before editing an existing graph and whenever the user may have changed things."
             ),
             "parameters": {
@@ -28,6 +30,7 @@ TOOLS = [
                 "properties": {
                     "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Only these nodes (omit for all)."},
                     "full_values": {"type": "boolean", "description": "Untruncated widget values (full prompts etc.)."},
+                    "target": {"description": "Read inside a subgraph: the id of the subgraph node. Omit for the root graph. The result of a root read lists `subgraph_nodes`."},
                 },
             },
         },
@@ -391,6 +394,7 @@ TOOLS = [
                                 "output": {},
                                 "nodes": {"type": "array"},
                                 "workflow": {"type": "object", "additionalProperties": True},
+                                "target": {"description": "Subgraph node id to edit inside; omit for the root graph."},
                             },
                             "required": ["op"],
                         },
@@ -563,6 +567,11 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 - Use find_in_graph to locate the widget instead of guessing: search by name ("length", "duration", "seconds", "fps", "steps", "cfg", "denoise", "width") or by a value the user quoted. On a large graph several nodes may carry the same widget name — change the one on the active path to the output, and say so.
 - "Make it bigger/smaller/HD" → width/height on the empty-latent node, kept to the family's multiple (SD1.5 512 base, SDXL 1024, most video 16-pixel multiples). "More detail" → steps and/or a hires pass, not resolution alone. "Stronger/weaker LoRA" → strength_model/strength_clip. "Different every run" → the seed widget's control_after_generate = randomize.
 - When the user's phrasing maps to several widgets, change the smallest set that achieves it and report exactly what moved.
+
+# Subgraphs
+- A node marked `subgraph` in get_graph contains a whole graph of its own. Its widgets are NOT the settings inside it; you cannot judge what it does from its title.
+- Read it with get_graph({target: <node id>}), and edit it by putting the same `target` on your ops. find_in_graph searches nested graphs by default and tells you which target each hit needs.
+- Never describe, praise or approve the contents of a subgraph you have not read — no "the settings look good" about a graph you cannot see. Read it, or say plainly that you have not.
 
 # Missing nodes — say what is needed, never hand over a broken graph
 - Before you build with a node you have not confirmed, and before loading any template that lists requires_custom_nodes, call check_nodes_available with the class names. The node index on this machine is the only truth about what exists.

@@ -22,6 +22,10 @@ agent requests, which run on your machine using its OpenRouter key.
   a time, flash as they land, the camera follows them off-screen, and links draw
   themselves. The whole batch is still one Undo. Set
   `localStorage["pixio-agent.speed"]` to `instant` / `fast` / `normal` / `slow`.
+- **It sees inside subgraphs.** A subgraph node is a whole graph in disguise;
+  the agent reads it with `get_graph({target: <id>})`, searches nested graphs by
+  default, and edits inside one by putting the same `target` on its ops — rather
+  than guessing at a node it cannot open.
 - **It edits, not just creates.** Adds and removes nodes, wires links by name or
   index, sets widgets, bypasses/mutes, groups, retitles, auto-arranges.
 - **It validates like the queue does.** Runs ComfyUI's own `validate_prompt`

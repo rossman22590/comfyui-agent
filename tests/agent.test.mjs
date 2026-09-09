@@ -32,7 +32,7 @@ let graphCode = await readFile(new URL("../web/agent-graph.js", import.meta.url)
 graphCode = graphCode.replace('import { app } from "../../scripts/app.js";', "const app = globalThis.__agentTestApp;")
   .replace('"./agent-stream-parser.js"', JSON.stringify(parserURL));
 const graphURL = dataModule(graphCode);
-const { createStreamingApplier, applyOps } = await import(graphURL);
+const { createStreamingApplier, applyOps, TOOL_IMPL } = await import(graphURL);
 let runtimeCode = await readFile(new URL("../web/agent-runtime.js", import.meta.url), "utf8");
 runtimeCode = runtimeCode.replace('import { app } from "../../scripts/app.js";', "const app = globalThis.__agentTestApp;")
   .replace('"./agent-graph.js"', JSON.stringify(graphURL));
@@ -217,4 +217,59 @@ test("a display name is resolved to the real class instead of failing", async ()
   } finally {
     LiteGraph.createNode = real;
   }
+});
+
+test("a subgraph is visible, readable and editable through its target", async () => {
+  resetGraph();
+  // a subgraph node carries its own LGraph; ids are scoped to that inner graph
+  let innerId = 100;
+  const inner = {
+    _nodes: [], _groups: [], inputs: [{ name: "latent" }], outputs: [{ name: "IMAGE" }],
+    add(node) { node.id = ++innerId; this._nodes.push(node); },
+    getNodeById(id) { return this._nodes.find((n) => n.id === id); },
+    remove(node) { this._nodes = this._nodes.filter((n) => n !== node); },
+    setDirtyCanvas() {},
+  };
+  inner.add({ type: "KSampler", mode: 0, title: "KSampler", pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [], widgets: [{ name: "steps", type: "number", value: 20, options: {} }] });
+
+  const host = { type: "MyPipeline", mode: 0, title: "Refiner", pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [], widgets: [], subgraph: inner };
+  app.graph.add(host);
+
+  // the root read must advertise the doorway rather than hide it
+  const root = await TOOL_IMPL.get_graph({});
+  assert.deepEqual(root.subgraph_nodes, [host.id]);
+  const hostNode = root.nodes.find((n) => n.id === host.id);
+  assert.equal(hostNode.subgraph.inner_node_count, 1);
+  assert.deepEqual(hostNode.subgraph.inputs, ["latent"]);
+
+  // reading inside returns the inner nodes, not the root's
+  const insideGraph = await TOOL_IMPL.get_graph({ target: host.id });
+  assert.deepEqual(insideGraph.scope, { subgraph_node: host.id, name: "Refiner" });
+  assert.equal(insideGraph.nodes[0].type, "KSampler");
+  assert.equal(insideGraph.nodes[0].id, 101);
+
+  // find_in_graph descends and reports the target needed to edit each hit
+  const found = await TOOL_IMPL.find_in_graph({ widget: "steps" });
+  assert.equal(found.total, 1);
+  assert.equal(found.nodes[0].target, host.id, "a nested hit says which subgraph to target");
+
+  // an op with a target edits the inner graph and leaves the root alone
+  const edited = await applyOps([
+    { op: "set_widgets", target: host.id, node: 101, widgets: { steps: 30 } },
+    { op: "add_node", target: host.id, type: "VAEDecode", ref: "dec" },
+  ]);
+  assert.equal(edited.failed, 0);
+  assert.equal(inner._nodes[0].widgets[0].value, 30);
+  assert.equal(inner._nodes.length, 2, "the new node landed inside the subgraph");
+  assert.equal(app.graph._nodes.length, 1, "the root graph gained nothing");
+  assert.deepEqual(edited.results[0].target, { subgraph_node: host.id, name: "Refiner" });
+
+  // a bad target must fail loudly instead of silently editing the root
+  const wrong = await applyOps([{ op: "add_node", target: 9999, type: "KSampler" }]);
+  assert.equal(wrong.failed, 1);
+  assert.match(wrong.results[0].error, /not a node in the root graph/);
+  const notASubgraph = await applyOps([{ op: "add_node", target: host.id + 500, type: "KSampler" }]);
+  assert.equal(notASubgraph.failed, 1);
 });
