@@ -394,7 +394,7 @@ TOOLS = [
                     "node": {"description": "The node holding the value, or the loader to replace."},
                     "widget": {"type": "string", "description": "Widget name to expose. Omit when replacing a media loader."},
                     "replace": {"type": "boolean", "description": "True to swap a LoadImage/LoadAudio-style node for an external input."},
-                    "input_id": {"type": "string", "description": "API name, snake_case. Defaults to input_<widget>."},
+                    "input_id": {"type": "string", "description": "API name, snake_case. Defaults to the widget's own name."},
                     "display_name": {"type": "string", "description": "What the run form shows a human."},
                     "description": {"type": "string"},
                     "default_value_url": {"type": "string", "description": "Fallback URL for an image/video/audio input."},
