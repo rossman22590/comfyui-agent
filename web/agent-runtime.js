@@ -224,11 +224,11 @@ export async function loadConfig(force = false) {
   return store.config;
 }
 
-export async function saveConfig({ model, api_key, web_search }) {
+export async function saveConfig({ model, api_key, web_search, provider, base_url }) {
   const res = await fetch("/pixio-agent/config", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, api_key, web_search }),
+    body: JSON.stringify({ model, api_key, web_search, provider, base_url }),
   });
   if (!res.ok) throw new Error(`could not save settings (${res.status})`);
   store.config = await res.json();
@@ -849,7 +849,8 @@ const HOST_HANDLERS = {
   },
   agent_undo: async () => undoLast(),
   agent_config: async (data) =>
-    data && (data.model || "api_key" in data || "web_search" in data)
+    data &&
+    (data.model || "api_key" in data || "web_search" in data || data.provider || "base_url" in data)
       ? saveConfig(data)
       : loadConfig(true),
   /** The OpenRouter catalog, so a host UI can offer a real model picker. */

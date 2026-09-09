@@ -140,3 +140,64 @@ class PromptCoverageTests(unittest.TestCase):
         # Model-specific numbers age badly and the agent must not assert them.
         self.assertIn("starting points to verify", self.prompt)
         self.assertIn("shape to verify, never a fact to assert", self.prompt)
+
+
+class ProviderConfigTests(unittest.TestCase):
+    """Two providers, each keeping its own key and model."""
+
+    def setUp(self):
+        import os, tempfile
+        source = (ROOT / "agent_routes.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        wanted = {
+            "_config_dirs", "_config_path_for_write", "_config_path_for_read",
+            "config_storage", "_read_config", "_write_config", "resolve_provider",
+            "resolve_base_url", "_config_key_field", "resolve_api_key", "key_from_env",
+            "resolve_model",
+        }
+        names = {"PROVIDERS", "DEFAULT_BASE_URLS", "PERSISTENT_CONFIG_DIR", "DEFAULT_MODEL"}
+        body = [n for n in tree.body
+                if (isinstance(n, ast.FunctionDef) and n.name in wanted)
+                or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in names)]
+        self.dir = tempfile.mkdtemp()
+        os.environ["PIXIO_AGENT_CONFIG_DIR"] = self.dir
+        for var in ("OPENROUTER_API_KEY", "PIXIO_AGENT_API_KEY", "PIXIO_AGENT_MODEL",
+                    "PIXIO_AGENT_PROVIDER", "PIXIO_AGENT_BASE_URL"):
+            os.environ.pop(var, None)
+        self.ns = {"os": os, "json": json, "Path": Path,
+                   "__file__": str((ROOT / "agent_routes.py").resolve())}
+        exec(compile(ast.Module(body=body, type_ignores=[]), "agent_routes.py", "exec"), self.ns)
+
+    def test_each_provider_keeps_its_own_key_and_model(self):
+        write, read = self.ns["_write_config"], self.ns["_read_config"]
+        write({
+            "provider": "openrouter",
+            "api_key": "sk-or-v1-router", "model": "anthropic/claude-sonnet-4.5",
+            "machine_api_key": "mach_gateway", "machine_model": "claude-sonnet-4.6",
+        })
+        self.assertEqual(self.ns["resolve_provider"](), "openrouter")
+        self.assertEqual(self.ns["resolve_api_key"](), "sk-or-v1-router")
+        self.assertEqual(self.ns["resolve_model"](), "anthropic/claude-sonnet-4.5")
+
+        # switching provider must not disturb the other one's credentials
+        cfg = read(); cfg["provider"] = "machine"; write(cfg)
+        self.assertEqual(self.ns["resolve_provider"](), "machine")
+        self.assertEqual(self.ns["resolve_api_key"](), "mach_gateway")
+        self.assertEqual(self.ns["resolve_model"](), "claude-sonnet-4.6")
+        self.assertEqual(self.ns["resolve_api_key"]("openrouter"), "sk-or-v1-router",
+                         "the OpenRouter key survives the switch")
+
+    def test_the_machine_base_url_is_right_and_overridable(self):
+        write = self.ns["_write_config"]
+        write({"provider": "machine"})
+        self.assertEqual(self.ns["resolve_base_url"](),
+                         "https://machineapi.myapps.ai/v1/llm/v1")
+        # /chat/completions is appended to this, matching the documented endpoint
+        self.assertTrue(self.ns["resolve_base_url"]().endswith("/v1"))
+        write({"provider": "machine", "base_url": "http://localhost:1234/v1/"})
+        self.assertEqual(self.ns["resolve_base_url"](), "http://localhost:1234/v1",
+                         "a trailing slash never doubles up")
+
+    def test_an_unknown_provider_falls_back_rather_than_breaking(self):
+        self.ns["_write_config"]({"provider": "definitely-not-a-provider"})
+        self.assertEqual(self.ns["resolve_provider"](), "openrouter")

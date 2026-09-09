@@ -115,13 +115,62 @@ def _write_config(data: dict) -> None:
         pass
 
 
-def resolve_api_key() -> str:
-    return (
-        os.environ.get("OPENROUTER_API_KEY")
-        or os.environ.get("PIXIO_AGENT_API_KEY")
-        or _read_config().get("api_key")
-        or ""
+# Providers.
+#
+# OpenRouter is the default. "machine" is Machine — OpenAI-compatible Chat
+# Completions with mach_ keys and model ids from the models.dev catalog. Its
+# base URL is overridable, so the same path serves any other OpenAI-compatible
+# endpoint (LM Studio, vLLM, OpenAI itself). Each provider keeps its own key so
+# switching back does not lose the other one.
+#
+# The agent drives the graph entirely through tool calls, so an endpoint that
+# cannot do OpenAI tool calling will chat but never build anything. That is the
+# one thing to check before pointing this at something new.
+PROVIDERS = ("openrouter", "machine")
+DEFAULT_BASE_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    # Machine: OpenAI-compatible, mach_ keys, models.dev ids
+    "machine": "https://machineapi.myapps.ai/v1/llm/v1",
+}
+
+
+def resolve_provider() -> str:
+    name = (
+        os.environ.get("PIXIO_AGENT_PROVIDER")
+        or _read_config().get("provider")
+        or "openrouter"
+    ).strip().lower()
+    return name if name in PROVIDERS else "openrouter"
+
+
+def resolve_base_url(provider=None) -> str:
+    provider = provider or resolve_provider()
+    configured = (
+        os.environ.get("PIXIO_AGENT_BASE_URL")
+        or _read_config().get("base_url" if provider != "openrouter" else "openrouter_base_url")
+        or DEFAULT_BASE_URLS[provider]
     ).strip()
+    return configured.rstrip("/")
+
+
+def _config_key_field(provider: str) -> str:
+    return "api_key" if provider == "openrouter" else f"{provider}_api_key"
+
+
+def resolve_api_key(provider=None) -> str:
+    provider = provider or resolve_provider()
+    if provider == "openrouter":
+        env = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("PIXIO_AGENT_API_KEY")
+    else:
+        env = os.environ.get("PIXIO_AGENT_API_KEY")
+    return (env or _read_config().get(_config_key_field(provider)) or "").strip()
+
+
+def key_from_env(provider=None) -> bool:
+    provider = provider or resolve_provider()
+    if provider == "openrouter":
+        return bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("PIXIO_AGENT_API_KEY"))
+    return bool(os.environ.get("PIXIO_AGENT_API_KEY"))
 
 
 def resolve_web_search() -> bool:
@@ -133,11 +182,13 @@ def resolve_web_search() -> bool:
 
 
 def resolve_model() -> str:
-    return (
-        os.environ.get("PIXIO_AGENT_MODEL")
-        or _read_config().get("model")
-        or DEFAULT_MODEL
-    ).strip()
+    provider = resolve_provider()
+    field = "model" if provider == "openrouter" else f"{provider}_model"
+    configured = os.environ.get("PIXIO_AGENT_MODEL") or _read_config().get(field)
+    if configured:
+        return configured.strip()
+    # an OpenAI-compatible endpoint has no default we can guess at
+    return DEFAULT_MODEL if provider == "openrouter" else ""
 
 
 @routes.get("/pixio-agent/ping")
@@ -159,24 +210,38 @@ async def pixio_agent_ping(request):
 @routes.get("/pixio-agent/config")
 async def pixio_agent_get_config(request):
     cfg = _read_config()
-    key = cfg.get("api_key") or ""
+    provider = resolve_provider()
+    key = cfg.get(_config_key_field(provider)) or ""
+    from_env = key_from_env(provider)
     return web.json_response(
         {
+            "provider": provider,
+            "providers": [
+                {
+                    "id": "openrouter",
+                    "label": "OpenRouter",
+                    "key_prefix": "sk-or-v1-",
+                    "has_key": bool(resolve_api_key("openrouter")),
+                },
+                {
+                    "id": "machine",
+                    "label": "Machine",
+                    "key_prefix": "mach_",
+                    "has_key": bool(resolve_api_key("machine")),
+                },
+            ],
+            "base_url": resolve_base_url(provider),
+            "base_url_is_default": resolve_base_url(provider) == DEFAULT_BASE_URLS[provider],
             "model": resolve_model(),
-            "has_key": bool(resolve_api_key()),
-            "key_from_env": bool(
-                os.environ.get("OPENROUTER_API_KEY") or os.environ.get("PIXIO_AGENT_API_KEY")
-            ),
+            "has_key": bool(resolve_api_key(provider)),
+            "key_from_env": from_env,
             # never return the key itself
             "key_hint": f"…{key[-4:]}" if key else None,
-            "storage": "env" if os.environ.get("OPENROUTER_API_KEY") or os.environ.get("PIXIO_AGENT_API_KEY") else config_storage(),
-            "persists_across_rebuilds": bool(
-                os.environ.get("OPENROUTER_API_KEY")
-                or os.environ.get("PIXIO_AGENT_API_KEY")
-                or config_storage() == "volume"
-            ),
+            "storage": "env" if from_env else config_storage(),
+            "persists_across_rebuilds": bool(from_env or config_storage() == "volume"),
             "web_search": resolve_web_search(),
             "web_search_from_env": os.environ.get("PIXIO_AGENT_WEB_SEARCH") is not None,
+            "web_search_supported": provider == "openrouter",
         }
     )
 
@@ -189,16 +254,47 @@ async def pixio_agent_set_config(request):
         return web.json_response({"error": "invalid JSON body"}, status=400)
 
     cfg = _read_config()
+
+    # switching provider must not disturb the other one's key or model
+    if isinstance(body.get("provider"), str):
+        wanted = body["provider"].strip().lower()
+        if wanted not in PROVIDERS:
+            return web.json_response(
+                {"error": f"provider must be one of {', '.join(PROVIDERS)}"}, status=400
+            )
+        cfg["provider"] = wanted
+    provider = (
+        body["provider"].strip().lower()
+        if isinstance(body.get("provider"), str) and body["provider"].strip().lower() in PROVIDERS
+        else resolve_provider()
+    )
+
+    model_field = "model" if provider == "openrouter" else f"{provider}_model"
     if isinstance(body.get("model"), str) and body["model"].strip():
-        cfg["model"] = body["model"].strip()
+        cfg[model_field] = body["model"].strip()
+
+    if "base_url" in body:
+        url = (body.get("base_url") or "").strip().rstrip("/")
+        field = "openrouter_base_url" if provider == "openrouter" else "base_url"
+        if url:
+            if not url.startswith("https://") and not url.startswith("http://localhost"):
+                return web.json_response(
+                    {"error": "base_url must be https, or http on localhost"}, status=400
+                )
+            cfg[field] = url
+        else:
+            cfg.pop(field, None)  # back to this provider's default
+
     if "web_search" in body:
         cfg["web_search"] = bool(body.get("web_search"))
+
     if "api_key" in body:
         key = (body.get("api_key") or "").strip()
+        field = _config_key_field(provider)
         if key:
-            cfg["api_key"] = key
+            cfg[field] = key
         else:
-            cfg.pop("api_key", None)
+            cfg.pop(field, None)
     _write_config(cfg)
     return await pixio_agent_get_config(request)
 
@@ -207,7 +303,7 @@ async def pixio_agent_set_config(request):
 # OpenRouter catalog — so the UI offers a real model picker, not a text field
 # ---------------------------------------------------------------------------
 
-_MODEL_CACHE = {"at": 0.0, "models": []}
+_MODEL_CACHE = {"at": 0.0, "models": [], "provider": None}
 _MODEL_TTL = 1800
 
 
@@ -219,55 +315,95 @@ def _wants_tools(model: dict) -> bool:
 
 @routes.get("/pixio-agent/openrouter-models")
 async def pixio_agent_openrouter_models(request):
-    """Tool-capable OpenRouter models, newest-capable first.
+    """The configured provider's model list, tool-capable models first.
 
-    The catalog is public, so this works before a key is configured; the key is
-    only attached when present so per-account availability is reflected.
+    OpenRouter publishes rich metadata (pricing, context, modalities) and says
+    which models support tools, so we filter to those. An OpenAI-compatible
+    gateway only promises {"data": [{"id": ...}]}, so everything it lists is
+    offered and the user picks — filtering on absent metadata would hide the
+    whole catalog.
     """
+    provider = resolve_provider()
     now = time.time()
     force = request.query.get("refresh") == "1"
-    if not force and _MODEL_CACHE["models"] and now - _MODEL_CACHE["at"] < _MODEL_TTL:
-        return web.json_response({"models": _MODEL_CACHE["models"], "cached": True})
+    cached = _MODEL_CACHE.get("provider") == provider and _MODEL_CACHE["models"]
+    if not force and cached and now - _MODEL_CACHE["at"] < _MODEL_TTL:
+        return web.json_response(
+            {"models": _MODEL_CACHE["models"], "provider": provider, "cached": True}
+        )
 
     headers = {"Content-Type": "application/json"}
-    key = resolve_api_key()
+    key = resolve_api_key(provider)
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
+    url = f"{resolve_base_url(provider)}/models"
     try:
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("https://openrouter.ai/api/v1/models", headers=headers) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status != 200:
-                    raise RuntimeError(f"OpenRouter returned {resp.status}")
+                    raise RuntimeError(f"{url} returned {resp.status}")
                 data = await resp.json()
     except Exception as e:  # noqa: BLE001 — the UI falls back to a text field
-        logger.warning("could not fetch the OpenRouter catalog: %s", e)
-        if _MODEL_CACHE["models"]:
-            return web.json_response({"models": _MODEL_CACHE["models"], "stale": True})
-        return web.json_response({"error": str(e), "models": []}, status=502)
-
-    models = []
-    for model in data.get("data") or []:
-        if not _wants_tools(model):
-            continue
-        pricing = model.get("pricing") or {}
-        modalities = (model.get("architecture") or {}).get("input_modalities") or []
-        models.append(
-            {
-                "id": model.get("id"),
-                "name": model.get("name") or model.get("id"),
-                "context": model.get("context_length"),
-                "prompt_price": pricing.get("prompt"),
-                "completion_price": pricing.get("completion"),
-                "vision": "image" in modalities,
-                "provider": (model.get("id") or "").split("/")[0],
-            }
+        logger.warning("could not fetch the %s catalog: %s", provider, e)
+        if cached:
+            return web.json_response(
+                {"models": _MODEL_CACHE["models"], "provider": provider, "stale": True}
+            )
+        return web.json_response(
+            {"error": str(e), "models": [], "provider": provider}, status=502
         )
 
+    models = []
+
+    # Machine answers {"models": {id: {...}}} from the models.dev
+    # catalog — richer than OpenAI's {"data": [...]}, and it states outright
+    # whether a model can call tools, which is the only kind this agent can use.
+    if isinstance(data.get("models"), dict):
+        for model_id, row in data["models"].items():
+            if not row.get("tool_call"):
+                continue
+            cost = row.get("cost") or {}
+            modalities = (row.get("modalities") or {}).get("input") or []
+            models.append(
+                {
+                    "id": model_id,
+                    "name": row.get("name") or model_id,
+                    "context": (row.get("limit") or {}).get("context"),
+                    # the catalog quotes dollars per million; the UI multiplies
+                    # by a million, so hand it a per-token figure
+                    "prompt_price": str(cost["input"] / 1_000_000) if cost.get("input") is not None else None,
+                    "completion_price": str(cost["output"] / 1_000_000) if cost.get("output") is not None else None,
+                    "vision": "image" in modalities,
+                    "provider": row.get("provider") or provider,
+                    "reasoning": bool(row.get("reasoning")),
+                }
+            )
+    else:
+        for model in data.get("data") or []:
+            model_id = model.get("id")
+            if not model_id:
+                continue
+            if provider == "openrouter" and not _wants_tools(model):
+                continue
+            pricing = model.get("pricing") or {}
+            modalities = (model.get("architecture") or {}).get("input_modalities") or []
+            models.append(
+                {
+                    "id": model_id,
+                    "name": model.get("name") or model_id,
+                    "context": model.get("context_length"),
+                    "prompt_price": pricing.get("prompt"),
+                    "completion_price": pricing.get("completion"),
+                    "vision": "image" in modalities,
+                    "provider": model_id.split("/")[0] if "/" in model_id else provider,
+                }
+            )
+
     models.sort(key=lambda m: (m["provider"] or "", m["name"] or ""))
-    _MODEL_CACHE.update({"at": now, "models": models})
-    return web.json_response({"models": models})
+    _MODEL_CACHE.update({"at": now, "models": models, "provider": provider})
+    return web.json_response({"models": models, "provider": provider})
 
 
 # ---------------------------------------------------------------------------
@@ -908,10 +1044,13 @@ async def pixio_agent_chat(request):
 
     model = (body.get("model") or "").strip() or resolve_model()
 
-    # OpenRouter runs this one itself and returns the result inline — the
-    # browser never executes it, so it simply joins the tool list.
+    provider = resolve_provider()
+
+    # Web search is OpenRouter's own server-side tool; the browser never runs
+    # it. Other gateways have no equivalent, so it is simply not offered there.
     web_search = body.get("web_search")
     web_search = resolve_web_search() if web_search is None else bool(web_search)
+    web_search = web_search and provider == "openrouter"
     tools = [*TOOLS, {"type": "openrouter:web_search"}] if web_search else TOOLS
 
     payload = {
@@ -926,8 +1065,10 @@ async def pixio_agent_chat(request):
         "parallel_tool_calls": False,
         "max_tokens": int(os.environ.get("PIXIO_AGENT_MAX_TOKENS", "8000")),
         "temperature": 0.2,
-        "usage": {"include": True},
     }
+    if provider == "openrouter":
+        # OpenRouter-only: inline usage accounting on the final chunk
+        payload["usage"] = {"include": True}
 
     response = web.StreamResponse(
         headers={
@@ -945,14 +1086,17 @@ async def pixio_agent_chat(request):
     try:
         timeout = aiohttp.ClientTimeout(total=600, connect=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            if provider == "openrouter":
+                # attribution headers OpenRouter shows on the dashboard
+                headers["HTTP-Referer"] = "https://myapps.ai"
+                headers["X-Title"] = "Pixio Workflow Agent"
             async with session.post(
-                OPENROUTER_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                    "HTTP-Referer": "https://myapps.ai",
-                    "X-Title": "Pixio Workflow Agent",
-                },
+                f"{resolve_base_url(provider)}/chat/completions",
+                headers=headers,
                 json=payload,
             ) as upstream:
                 if upstream.status != 200:

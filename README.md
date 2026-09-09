@@ -66,8 +66,13 @@ Restart ComfyUI. No extra Python dependencies.
 
 ## Configure
 
-The agent talks to [OpenRouter](https://openrouter.ai), so you can point it at
-any frontier model. Give it a key either way:
+The agent talks to [OpenRouter](https://openrouter.ai) by default, or to
+**Machine** (`https://machineapi.myapps.ai/v1/llm/v1`) with a `mach_` key —
+pick one in the settings, and each keeps its own key and model so switching
+back costs nothing. The endpoint is overridable, so any OpenAI-compatible Chat
+Completions API works, provided it supports tool calling: the agent builds
+workflows entirely through tools, so an endpoint without them will chat and
+never build. Give it a key either way:
 
 - set `OPENROUTER_API_KEY` on the machine (recommended), or
 - open the ✨ **Workflow Agent** sidebar tab → ⚙ → paste a key. It is written to
