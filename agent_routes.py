@@ -361,7 +361,16 @@ async def pixio_agent_openrouter_models(request):
     # catalog — richer than OpenAI's {"data": [...]}, and it states outright
     # whether a model can call tools, which is the only kind this agent can use.
     if isinstance(data.get("models"), dict):
-        for model_id, row in data["models"].items():
+        # The catalog is the whole of models.dev — thousands of rows, most of
+        # them the same model re-listed under a third-party router
+        # ("nano-gpt/anthropic/claude-sonnet-4.6"). Those resolve to a provider
+        # the project has no key for and fail with provider_not_connected. The
+        # gateway's own models are the ones with a bare id, and that set is
+        # exactly what its dashboard lists — so offer those.
+        rows = {k: v for k, v in data["models"].items() if "/" not in k}
+        if not rows:  # a differently-shaped gateway: better all than none
+            rows = data["models"]
+        for model_id, row in rows.items():
             if not row.get("tool_call"):
                 continue
             cost = row.get("cost") or {}

@@ -201,3 +201,56 @@ class ProviderConfigTests(unittest.TestCase):
     def test_an_unknown_provider_falls_back_rather_than_breaking(self):
         self.ns["_write_config"]({"provider": "definitely-not-a-provider"})
         self.assertEqual(self.ns["resolve_provider"](), "openrouter")
+
+
+class MachineCatalogTests(unittest.TestCase):
+    """The Machine catalog is models.dev; only its own models actually run."""
+
+    def setUp(self):
+        source = (ROOT / "agent_routes.py").read_text(encoding="utf-8")
+        start = source.index("    models = []\n\n    # Machine answers")
+        end = source.index("    models.sort(", start)
+        body = ("def build(data, provider, _wants_tools=lambda m: True):\n"
+                + source[start:end] + "    return models\n")
+        self.ns = {}
+        exec(compile(body, "agent_routes.py", "exec"), self.ns)
+
+    def test_routed_duplicates_are_dropped_because_they_cannot_run(self):
+        # a bare id is the gateway's own model; a slashed id is the same model
+        # re-listed under a third-party router the project has no key for
+        data = {"models": {
+            "claude-sonnet-4.6": {
+                "name": "Claude Sonnet 4.6", "provider": "kortix", "tool_call": True,
+                "cost": {"input": 3, "output": 15},
+                "modalities": {"input": ["text", "image"]}, "limit": {"context": 1000000},
+            },
+            "nano-gpt/anthropic/claude-sonnet-4.6": {
+                "name": "Claude Sonnet 4.6", "provider": "nano-gpt", "tool_call": True,
+            },
+            "vercel/anthropic/claude-sonnet-4.6": {
+                "name": "Claude Sonnet 4.6", "provider": "vercel", "tool_call": True,
+            },
+            "some-chat-only-model": {"name": "Chatty", "provider": "kortix", "tool_call": False},
+        }}
+        out = self.ns["build"](data, "machine")
+        self.assertEqual([m["id"] for m in out], ["claude-sonnet-4.6"])
+
+        row = out[0]
+        self.assertTrue(row["vision"])
+        self.assertEqual(row["context"], 1000000)
+        # the catalog quotes dollars per million; the UI multiplies by a million
+        self.assertAlmostEqual(float(row["prompt_price"]) * 1_000_000, 3)
+        self.assertAlmostEqual(float(row["completion_price"]) * 1_000_000, 15)
+
+    def test_a_gateway_with_only_routed_ids_still_offers_something(self):
+        data = {"models": {"router/vendor/model": {"name": "M", "tool_call": True}}}
+        out = self.ns["build"](data, "machine")
+        self.assertEqual(len(out), 1, "better all than an empty picker")
+
+    def test_the_openai_shape_is_still_understood(self):
+        data = {"data": [{"id": "x/y", "name": "Y", "context_length": 8000,
+                          "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+                          "architecture": {"input_modalities": ["text", "image"]}}]}
+        out = self.ns["build"](data, "openrouter")
+        self.assertEqual(out[0]["id"], "x/y")
+        self.assertTrue(out[0]["vision"])
