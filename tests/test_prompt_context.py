@@ -123,6 +123,20 @@ class PromptCoverageTests(unittest.TestCase):
         ]:
             self.assertIn(rule, self.prompt.lower(), f"missing guard: {rule}")
 
-    def test_it_stays_short_enough_to_be_followed(self):
+    def test_reference_may_be_deep_but_instructions_stay_terse(self):
+        # Depth is fine: recipes and failure signatures are read, not obeyed.
+        # What must stay short is the part the model has to hold while working.
         words = len(self.prompt.split())
-        self.assertLess(words, 2200, "the prompt is drifting back toward unfollowable")
+        self.assertLess(words, 3200, "the prompt is drifting back toward unfollowable")
+
+        loop = self.prompt.split("# The loop")[1].split("# Diagnosing")[0]
+        self.assertLess(
+            len(loop.split()), 750, "the working loop is the part that must stay tight"
+        )
+        never = self.prompt.split("# Never")[1].split("# How ComfyUI works")[0]
+        self.assertLess(len(never.split()), 260, "the hard rules must fit in one glance")
+
+    def test_recipes_are_framed_as_shapes_to_verify_not_facts(self):
+        # Model-specific numbers age badly and the agent must not assert them.
+        self.assertIn("starting points to verify", self.prompt)
+        self.assertIn("shape to verify, never a fact to assert", self.prompt)
