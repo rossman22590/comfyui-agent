@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-agent"
+description = "Graph-manipulation bridge for the Pixio Workflow Agent — lets an LLM in the Pixio workspace read, build, edit and validate the live ComfyUI node graph."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/rossman22590/comfyui-agent"
+
+[tool.comfy]
+PublisherId = "pixio"
+DisplayName = "Pixio Workflow Agent"
+Icon = ""
