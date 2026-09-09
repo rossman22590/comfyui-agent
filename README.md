@@ -46,6 +46,11 @@ agent requests, which run on your machine using its OpenRouter key.
   does not have, it names the pack and its GitHub URL (from the ComfyUI-Manager
   index) instead of building a graph that fails on Run — and offers the best
   workflow it can build from what you do have.
+- **It makes a workflow deployable.** `expose_input` swaps a fixed value for the
+  right ComfyUI Deploy external node and wires it — a choice list keeps its real
+  options, an input image replaces the loader and everything downstream follows
+  — and `check_deployable` catches what validation never does: a duplicate
+  input_id, an input wired to nothing, an Enum with no choices, no output node.
 - **It notices you.** If you rewire a node while it is building, the batch stops
   at that point instead of overwriting you: what landed is kept, the rest is
   refused, and it re-reads before continuing. The check covers structure only,

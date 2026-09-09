@@ -377,6 +377,50 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "expose_input",
+            "description": (
+                "Turn a fixed value into an API input, using the right ComfyUI Deploy external node and "
+                "wiring it correctly. Two shapes. For a SETTING — prompt, seed, steps, aspect_ratio, "
+                "resolution — pass node and widget: it picks the matching External type, keeps the current "
+                "value as the default, and for a choice list carries the real options across so the caller "
+                "has something to pick from. For MEDIA the caller supplies — an input image, video or audio "
+                "— pass the loader's node with replace:true: the loader is swapped for an External node and "
+                "everything downstream is rewired. Prefer this over building External nodes by hand with "
+                "apply_graph_ops; it picks the type, keeps input_ids unique and snake_case, and connects it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {"description": "The node holding the value, or the loader to replace."},
+                    "widget": {"type": "string", "description": "Widget name to expose. Omit when replacing a media loader."},
+                    "replace": {"type": "boolean", "description": "True to swap a LoadImage/LoadAudio-style node for an external input."},
+                    "input_id": {"type": "string", "description": "API name, snake_case. Defaults to input_<widget>."},
+                    "display_name": {"type": "string", "description": "What the run form shows a human."},
+                    "description": {"type": "string"},
+                    "default_value_url": {"type": "string", "description": "Fallback URL for an image/video/audio input."},
+                    "target": {"description": "Subgraph node id, if the value lives inside one."},
+                },
+                "required": ["node"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_deployable",
+            "description": (
+                "Audit the graph as an API endpoint: what is exposed, what it feeds, whether there is an "
+                "output node, and the faults that do not show up in validation — a duplicate or non-snake "
+                "input_id, an External node wired to nothing, an Enum with no options, a missing "
+                "display_name. Also lists values a caller would usually want that are still fixed. Run it "
+                "before telling the user a workflow is ready to deploy."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "apply_graph_ops",
             "description": (
                 "Edit the live graph with an ordered batch of operations applied as ONE undoable change. Ops:\n"
@@ -555,13 +599,13 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 # The loop
 **1 — Understand.** Read the request. If the canvas has nodes, get_graph first so you edit rather than duplicate, and honour the selection when the user says "this node". A node marked `subgraph`: read it with get_graph({target: id}) and edit it by putting the same target on your ops. find_in_graph searches nested graphs and reports the target each hit needs. When you name a node the user may struggle to find, focus_node selects and centres it.
 
-**2 — Look before guessing.** For "it broke / it's slow / it used to work": run_history covers this machine and list_workflow_runs the whole account including runs you never saw; list_workflow_versions says what changed since it worked. For "my upscaler / my LoRA / my image": list_my_workflows, get_my_workflow (inspects without touching the canvas), list_my_models, list_my_assets, list_my_machines.
+**2 — Look before guessing.** For "it broke / it's slow / it used to work": run_history covers this machine, list_workflow_runs the whole account; list_workflow_versions says what changed since it worked. For "my upscaler / my LoRA / my image": list_my_workflows, get_my_workflow (inspects without touching the canvas), list_my_models, list_my_assets, list_my_machines.
 
-**3 — Find the right shape.** For anything new, search list_workflow_templates first: the Comfy-Org library (source 'comfy-org') is 600+ maintained workflows and stays current with families newer than your training (the authority when it disagrees with the recipes below). Search by family: "wan video", "flux", "qwen image", "ace step audio". Adapt the closest match rather than assembling from memory. It ships local and `api_*` flavours of many models; take the local one unless asked otherwise. search_node_types finds exact class names for a family — never guess one — and get_node_type_details gives exact inputs, output indices and combo values. A result marked `hosted: true` is a paid endpoint. A MODEL name often matches one of those and nothing else, because an installed model is a FILE loaded by a generic node — search list_models for the same name before concluding it is the only way.
+**3 — Find the right shape.** For anything new, search list_workflow_templates first: the Comfy-Org library ('comfy-org') is 600+ maintained workflows, current with families newer than your training (the authority when it disagrees with the recipes below). Search by family: "wan video", "flux", "qwen image", "ace step audio". Adapt the closest match rather than assembling from memory. It ships local and `api_*` flavours of many models; take the local one unless asked otherwise. search_node_types finds exact class names for a family — never guess one — and get_node_type_details gives exact inputs, output indices and combo values. A result marked `hosted: true` is a paid endpoint. A MODEL name often matches one of those and nothing else, because an installed model is a FILE loaded by a generic node — search list_models for the same name before concluding it is the only way.
 
 **4 — Confirm it can run here.** A loaded template reports `runnable`, `missing_node_types` and `missing_models` — read them before you say a word about the workflow, and never call it ready while either is non-empty. Each missing model carries `installed_options`: switch the widget to one of those, or say what to download. Also check_nodes_available for every type you are not certain of, and for a template's requires_custom_nodes. All present → continue silently. Anything missing → stop and say what is missing, which pack ships it (name and URL from the result, never invented), and that it needs adding to this machine's custom nodes and a rebuild. In the same reply offer the best workflow you CAN build from what is installed, naming any credit cost. list_machine_custom_nodes shows which packs the machine was built with. Mid-build, resolve an unknown type before trying alternatives.
 
-**5 — Build.** A batch returning `user_edited_canvas` means the user changed something mid-build: what landed is kept, the rest was refused. Re-read with get_graph and continue from what is there; never re-send the refused ops. One apply_graph_ops batch where possible: add_node with refs and widgets, then connects by ref, then arrange. Your ops stream onto the canvas as you write them and the user watches it assemble — so emit in build order (loaders → conditioning → sampling → decode → output → connects → arrange), never re-emit an op, and never emit a connect before the node it references. Sensible defaults, real titles. Expose what a user would want to control (prompt, seed, size, duration, strength) with the Deploy external nodes when building for the API or when asked.
+**5 — Build.** A batch returning `user_edited_canvas` means the user changed something mid-build: what landed is kept, the rest was refused. Re-read with get_graph and continue from what is there; never re-send the refused ops. One apply_graph_ops batch where possible: add_node with refs and widgets, then connects by ref, then arrange. Your ops stream onto the canvas as you write them and the user watches it assemble — so emit in build order (loaders → conditioning → sampling → decode → output → connects → arrange), never re-emit an op, and never emit a connect before the node it references. Sensible defaults, real titles. For API/deployable work, expose_input each value the caller controls and each image/video/audio they supply, then check_deployable and fix what it reports.
 
 **6 — Verify.** Read every op result; ok:false gets fixed in a follow-up batch using the valid options the error lists. Then validate_workflow and fix everything it reports. If the user asked to run — or you want to prove a build works — run_workflow and read the real result. Fix and run again; three cycles on the same error means stop and explain. If a run seems to hang, list_queue — the machine may be busy. interrupt_run cancels, only when asked. A run's image is shown to you: judge it against what was asked and say plainly if it is wrong.
 

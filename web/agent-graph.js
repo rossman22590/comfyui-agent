@@ -1922,6 +1922,290 @@ TOOL_IMPL.view_canvas = async () => {
   };
 };
 
+// ---------------------------------------------------------------------------
+// making a workflow deployable
+// ---------------------------------------------------------------------------
+//
+// Running a workflow through the API means replacing fixed values with ComfyUI
+// Deploy external input nodes, and that is where hand-built graphs go wrong in
+// ways validation never catches: the wrong External type for the socket, an
+// Enum with no options so the caller has nothing to choose from, an input_id
+// that collides, a node left unwired, or no output node at all. The workflow
+// runs perfectly in the editor and is simply not controllable once deployed.
+//
+// Two shapes of exposure, because they are genuinely different operations:
+//   - a WIDGET (prompt, steps, aspect_ratio) gains an External node wired into
+//     that widget's socket, keeping its current value as the default;
+//   - a MEDIA input (an image, video or audio the caller supplies) replaces the
+//     loader that produced it, so everything downstream keeps working.
+// Node types are discovered from what is installed, never assumed.
+
+const DEPLOY_INPUT_PREFIX = "ComfyUIDeployExternal";
+const DEPLOY_OUTPUT_PREFIX = "ComfyUIDeployOutput";
+
+function snakeCase(text) {
+  return String(text)
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function deployNodeType(suffix, info) {
+  const type = `${DEPLOY_INPUT_PREFIX}${suffix}`;
+  return info[type] ? type : null;
+}
+
+/** The External node that matches a widget, from what this machine has. */
+function externalTypeForWidget(node, widget, info) {
+  const pick = (...suffixes) => suffixes.map((s) => deployNodeType(s, info)).find(Boolean) ?? null;
+  const name = String(widget?.name ?? "").toLowerCase();
+  const values = Array.isArray(widget?.options?.values) ? widget.options.values : null;
+
+  // a seed is an int, but it has its own node carrying the randomise semantics
+  if (name === "seed" || name === "noise_seed") return pick("Seed", "NumberInt");
+  if (name === "ckpt_name") return pick("Checkpoint", "Enum");
+  if (name === "lora_name") return pick("Lora", "Enum");
+  // any fixed set of choices — sampler, scheduler, aspect_ratio, resolution
+  if (values) return pick("Enum", "Text");
+
+  const socket = (node.inputs ?? []).find((i) => i.name === widget?.name);
+  const socketType = String(socket?.type ?? "").toUpperCase();
+  if (socketType === "BOOLEAN" || typeof widget?.value === "boolean") return pick("Boolean", "Text");
+  if (socketType === "INT") return pick("NumberInt", "Number");
+  if (socketType === "FLOAT") return pick("Number", "NumberInt");
+  if (typeof widget?.value === "number") {
+    return Number.isInteger(widget.value) ? pick("NumberInt", "Number") : pick("Number");
+  }
+  return pick("Text");
+}
+
+function existingInputIds(graph) {
+  const ids = new Map();
+  for (const node of nodesOf(graph)) {
+    if (!String(node.type).startsWith(DEPLOY_INPUT_PREFIX)) continue;
+    const widget = (node.widgets ?? []).find((w) => w.name === "input_id");
+    if (widget?.value) ids.set(String(widget.value), node.id);
+  }
+  return ids;
+}
+
+function uniqueInputId(graph, wanted) {
+  const taken = existingInputIds(graph);
+  let id = snakeCase(wanted) || "input_value";
+  if (!taken.has(id)) return { id, renamed: false };
+  let n = 2;
+  while (taken.has(`${id}_${n}`)) n++;
+  return { id: `${id}_${n}`, renamed: true };
+}
+
+function setIfPresent(node, name, value) {
+  const widget = (node.widgets ?? []).find((w) => w.name === name);
+  if (widget && value !== undefined && value !== null) widget.value = value;
+  return !!widget;
+}
+
+function labelFor(name) {
+  return String(name)
+    .replace(/_/g, " ")
+    .replace(/^\w/, (c) => c.toUpperCase());
+}
+
+async function exposeInput(args) {
+  const { graph } = graphFor(args.target);
+  const info = await getObjectInfo();
+  const node = resolveNode(new Map(), args.node ?? args.node_id, graph);
+  if (!node) throw new Error(`expose_input: node "${args.node ?? args.node_id}" not found`);
+
+  const replacing = args.replace === true || (!args.widget && !args.input);
+  return replacing
+    ? replaceWithExternal({ graph, info, node, args })
+    : exposeWidgetAsInput({ graph, info, node, args });
+}
+
+/** A widget the caller should control: External node wired into its socket. */
+async function exposeWidgetAsInput({ graph, info, node, args }) {
+  const widgetName = args.widget ?? args.input;
+  const widget = (node.widgets ?? []).find((w) => w.name === widgetName);
+  if (!widget) {
+    throw new Error(
+      `expose_input: "${widgetName}" is not a widget on ${node.type} (#${node.id}). Widgets: ${(node.widgets ?? []).map((w) => w.name).join(", ") || "none"}. For an image, video or audio input, call expose_input with replace:true on the loader node instead.`,
+    );
+  }
+
+  const type = externalTypeForWidget(node, widget, info);
+  if (!type) {
+    throw new Error(
+      "expose_input: the ComfyUI Deploy external input nodes are not installed on this machine, so the workflow cannot take API inputs",
+    );
+  }
+
+  const { id, renamed } = uniqueInputId(graph, args.input_id || `input_${widgetName}`);
+  const external = LiteGraph.createNode(type);
+  if (!external) throw new Error(`expose_input: could not create ${type}`);
+  graph.add(external);
+  external.title = args.display_name || labelFor(widgetName);
+  external.pos = [node.pos[0] - (external.size?.[0] ?? 300) - 60, node.pos[1]];
+
+  setIfPresent(external, "input_id", id);
+  setIfPresent(external, "display_name", args.display_name || labelFor(widgetName));
+  setIfPresent(external, "description", args.description);
+  setIfPresent(external, "default_value", widget.value);
+
+  // An Enum with no options gives the caller nothing to pick from, so carry
+  // the widget's real choices across — newline separated, as the node expects.
+  const choices = Array.isArray(widget.options?.values) ? widget.options.values : null;
+  if (choices && setIfPresent(external, "options", choices.join("\n"))) {
+    // default must be one of them
+    setIfPresent(external, "default_value", choices.includes(widget.value) ? widget.value : choices[0]);
+  }
+  // numeric nodes carry a range; widen it to the widget's own bounds
+  if (widget.options?.min !== undefined) setIfPresent(external, "min_value", widget.options.min);
+  if (widget.options?.max !== undefined) setIfPresent(external, "max_value", widget.options.max);
+
+  const inIdx = findInputSlot(node, widgetName);
+  if (inIdx < 0) {
+    graph.remove(external);
+    throw new Error(
+      `expose_input: "${widgetName}" on ${node.type} (#${node.id}) has no input socket to drive. ${describeSlots(node)}`,
+    );
+  }
+  external.connect(0, node, inIdx);
+  redraw();
+
+  return {
+    exposed: {
+      input_id: id,
+      display_name: args.display_name || labelFor(widgetName),
+      type,
+      default_value: widget.value,
+      ...(choices ? { options: choices } : {}),
+    },
+    external_node: external.id,
+    feeds: `${node.type} (#${node.id}).${widgetName}`,
+    ...(renamed ? { renamed: "that input_id was taken, so this one was numbered" } : {}),
+  };
+}
+
+/** A media loader the caller should supply: swap it for an External node. */
+function replaceWithExternal({ graph, info, node, args }) {
+  const produced = (node.outputs ?? []).map((o) => String(o.type).toUpperCase());
+  const kind = ["IMAGE", "VIDEO", "AUDIO"].find((k) => produced.includes(k));
+  if (!kind) {
+    throw new Error(
+      `expose_input: ${node.type} (#${node.id}) does not output an image, video or audio, so there is nothing for the caller to supply. To expose one of its settings, pass widget: "<name>".`,
+    );
+  }
+  const type = deployNodeType(kind.charAt(0) + kind.slice(1).toLowerCase(), info);
+  if (!type) {
+    throw new Error(`expose_input: ComfyUIDeployExternal${kind.charAt(0)}${kind.slice(1).toLowerCase()} is not installed on this machine`);
+  }
+
+  const slot = produced.indexOf(kind);
+  // every consumer of the loader has to be moved across, or the graph breaks
+  const consumers = [];
+  for (const link of node.outputs?.[slot]?.links ?? []) {
+    const resolved = linkById(link, graph);
+    const target = resolved && graph.getNodeById?.(resolved.target_id ?? resolved.origin_id);
+    if (resolved && target) consumers.push({ node: target, slot: resolved.target_slot });
+  }
+
+  const { id, renamed } = uniqueInputId(graph, args.input_id || `input_${kind.toLowerCase()}`);
+  const external = LiteGraph.createNode(type);
+  if (!external) throw new Error(`expose_input: could not create ${type}`);
+  graph.add(external);
+  external.title = args.display_name || labelFor(kind.toLowerCase());
+  external.pos = [...node.pos];
+  setIfPresent(external, "input_id", id);
+  setIfPresent(external, "display_name", args.display_name || labelFor(kind.toLowerCase()));
+  setIfPresent(external, "description", args.description);
+  // the image node takes a URL as its fallback rather than a value
+  setIfPresent(external, "default_value_url", args.default_value_url);
+
+  for (const consumer of consumers) external.connect(0, consumer.node, consumer.slot);
+  graph.remove(node);
+  redraw();
+
+  return {
+    exposed: { input_id: id, display_name: args.display_name || labelFor(kind.toLowerCase()), type, kind },
+    external_node: external.id,
+    replaced: `${node.type} (#${node.id})`,
+    rewired: consumers.map((c) => `${c.node.type} (#${c.node.id}) input ${c.slot}`),
+    ...(consumers.length === 0
+      ? { warning: "that loader fed nothing, so the new input feeds nothing either — wire it to whatever should consume it" }
+      : {}),
+    ...(renamed ? { renamed: "that input_id was taken, so this one was numbered" } : {}),
+  };
+}
+
+/** What stands between this graph and a working API deployment. */
+async function checkDeployable() {
+  const info = await getObjectInfo();
+  const nodes = nodesOf(app.graph);
+  const inputs = [];
+  const problems = [];
+  const seen = new Map();
+
+  for (const node of nodes) {
+    if (!String(node.type).startsWith(DEPLOY_INPUT_PREFIX)) continue;
+    const values = Object.fromEntries((node.widgets ?? []).map((w) => [w.name, w.value]));
+    const id = String(values.input_id ?? "");
+    const wired = (node.outputs?.[0]?.links ?? []).length;
+    inputs.push({
+      node_id: node.id,
+      type: node.type,
+      input_id: id,
+      display_name: values.display_name,
+      default_value: values.default_value,
+      connected: wired > 0,
+    });
+    if (!id) problems.push(`#${node.id} has no input_id, so the API cannot address it`);
+    else if (id !== snakeCase(id)) problems.push(`#${node.id} input_id "${id}" is not snake_case`);
+    else if (seen.has(id)) problems.push(`input_id "${id}" is used by both #${seen.get(id)} and #${node.id}`);
+    if (id) seen.set(id, node.id);
+    if (!wired) problems.push(`#${node.id} ("${id || node.type}") is wired to nothing, so setting it would do nothing`);
+    if (!values.display_name) problems.push(`#${node.id} has no display_name, so the run form shows a raw id`);
+    if (node.type.endsWith("Enum") && !String(values.options ?? "").trim()) {
+      problems.push(`#${node.id} is an Enum with no options, so the caller has nothing to choose from`);
+    }
+  }
+
+  const outputs = nodes
+    .filter((n) => String(n.type).startsWith(DEPLOY_OUTPUT_PREFIX) || info[n.type]?.output_node)
+    .map((n) => ({ node_id: n.id, type: n.type }));
+  if (!outputs.length) problems.push("there is no output node, so a run would produce nothing");
+
+  // what a caller would most likely want to control but cannot yet
+  const driven = new Set(
+    nodes.flatMap((n) => (n.inputs ?? []).filter((i) => i.link != null).map((i) => `${n.id}:${i.name}`)),
+  );
+  const worth = /^(text|prompt|seed|noise_seed|width|height|length|denoise|cfg|steps|strength_model|aspect_ratio|resolution|filename_prefix)$/;
+  const suggestions = [];
+  for (const node of nodes) {
+    if (String(node.type).startsWith(DEPLOY_INPUT_PREFIX)) continue;
+    for (const widget of node.widgets ?? []) {
+      if (!worth.test(widget.name ?? "")) continue;
+      if (driven.has(`${node.id}:${widget.name}`)) continue;
+      suggestions.push({ node: node.id, node_type: node.type, widget: widget.name, value: widget.value });
+    }
+  }
+
+  return {
+    deployable: problems.length === 0 && inputs.length > 0,
+    inputs,
+    outputs,
+    problems,
+    not_yet_exposed: suggestions.slice(0, 12),
+    note: inputs.length
+      ? "Fix every problem before telling the user this is ready to deploy."
+      : "Nothing is exposed: every value is fixed, so a deployed run would always produce the same thing. expose_input on what the caller should control.",
+  };
+}
+
+TOOL_IMPL.expose_input = async (args) => exposeInput(args ?? {});
+TOOL_IMPL.check_deployable = async () => checkDeployable();
+MUTATING_TOOLS.add("expose_input");
+
 TOOL_IMPL.find_in_graph = async (args) => findInGraph(args);
 TOOL_IMPL.new_workflow = async (args) => newWorkflow(args);
 MUTATING_TOOLS.add("new_workflow");

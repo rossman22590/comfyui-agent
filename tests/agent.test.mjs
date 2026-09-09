@@ -24,6 +24,7 @@ function resetGraph() {
     _nodes: [], _groups: [], before: 0, after: 0,
     add(node) { node.id = ++nextId; this._nodes.push(node); },
     getNodeById(id) { return this._nodes.find((node) => node.id === id); },
+    remove(node) { this._nodes = this._nodes.filter((n) => n !== node); },
     serialize() { return { nodes: this._nodes.map((n) => ({ id: n.id, type: n.type, widgets: n.widgets })) }; },
     beforeChange() { this.before++; }, afterChange() { this.after++; }, setDirtyCanvas() {},
   };
@@ -493,5 +494,83 @@ test("a user edit mid-batch stops the build; our own highlight does not", async 
     assert.equal(victim.widgets[0].value, 8, "the user's change survives untouched");
   } finally {
     app.graph.setDirtyCanvas = realDirty;
+  }
+});
+
+test("exposing an aspect ratio carries its choices; exposing an image replaces the loader", async () => {
+  forgetObjectInfo();
+  resetGraph();
+  const DEPLOY = {
+    ComfyUIDeployExternalEnum: {
+      input: { required: { input_id: ["STRING"] },
+               optional: { default_value: ["STRING"], options: ["STRING"], display_name: ["STRING"] } },
+      output: ["*"],
+    },
+    ComfyUIDeployExternalImage: {
+      input: { required: { input_id: ["STRING"] }, optional: { default_value_url: ["STRING"], display_name: ["STRING"] } },
+      output: ["IMAGE"],
+    },
+    ComfyUIDeployExternalText: { input: { required: { input_id: ["STRING"] } }, output: ["STRING"] },
+  };
+  globalThis.fetch = async () => new Response(JSON.stringify(DEPLOY));
+  const widgetsFor = (type) => ({
+    ComfyUIDeployExternalEnum: ["input_id", "default_value", "options", "display_name", "description"],
+    ComfyUIDeployExternalImage: ["input_id", "default_value_url", "display_name", "description"],
+    ComfyUIDeployExternalText: ["input_id", "default_value", "display_name", "description"],
+  })[type] ?? [];
+  const realCreate = LiteGraph.createNode;
+  LiteGraph.createNode = (type) => ({
+    type, mode: 0, title: type, pos: [0, 0], size: [300, 150],
+    inputs: [], outputs: [{ name: "out", type: "*", links: [] }],
+    widgets: widgetsFor(type).map((name) => ({ name, type: "text", value: "", options: {} })),
+    connect(slot, target, targetSlot) {
+      target.inputs[targetSlot].link = 1;
+      this.outputs[0].links.push(1);
+      return true;
+    },
+  });
+
+  try {
+    // an aspect ratio: a COMBO whose choices must survive into the Enum
+    const sampler = {
+      type: "Krea2Image", mode: 0, title: "Krea", pos: [400, 100], size: [300, 200],
+      widgets: [{ name: "aspect_ratio", type: "combo", value: "16:9",
+                  options: { values: ["1:1", "16:9", "9:16"] } }],
+      inputs: [{ name: "aspect_ratio", type: "COMBO", link: null }],
+      outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+    };
+    app.graph.add(sampler);
+    const enumResult = await TOOL_IMPL.expose_input({ node: sampler.id, widget: "aspect_ratio" });
+    assert.equal(enumResult.exposed.type, "ComfyUIDeployExternalEnum");
+    assert.equal(enumResult.exposed.input_id, "input_aspect_ratio");
+    assert.deepEqual(enumResult.exposed.options, ["1:1", "16:9", "9:16"], "the caller gets the real choices");
+    const created = app.graph._nodes.find((n) => n.type === "ComfyUIDeployExternalEnum");
+    assert.equal(created.widgets.find((w) => w.name === "options").value, "1:1\n16:9\n9:16");
+    assert.equal(created.widgets.find((w) => w.name === "default_value").value, "16:9", "the current value stays the default");
+    assert.equal(sampler.inputs[0].link, 1, "and it is actually wired in");
+
+    // an input image: the loader is replaced and its consumer rewired
+    const loader = { type: "LoadImage", mode: 0, title: "Load", pos: [0, 0], size: [200, 100],
+      widgets: [], inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: [7] }] };
+    app.graph.add(loader);
+    const consumer = { type: "VAEEncode", mode: 0, title: "Encode", pos: [300, 0], size: [200, 100],
+      widgets: [], inputs: [{ name: "pixels", type: "IMAGE", link: 7 }], outputs: [] };
+    app.graph.add(consumer);
+    app.graph.links = new Map([[7, { origin_id: loader.id, target_id: consumer.id, target_slot: 0 }]]);
+
+    const imageResult = await TOOL_IMPL.expose_input({ node: loader.id, replace: true });
+    assert.equal(imageResult.exposed.type, "ComfyUIDeployExternalImage");
+    assert.equal(imageResult.exposed.kind, "IMAGE");
+    assert.match(imageResult.replaced, /LoadImage/);
+    assert.equal(imageResult.rewired.length, 1, "the consumer follows the swap");
+    assert.equal(app.graph._nodes.some((n) => n.type === "LoadImage"), false, "the loader is gone");
+
+    // and a widget that is not a widget gets a useful error, not a crash
+    await assert.rejects(
+      TOOL_IMPL.expose_input({ node: sampler.id, widget: "nope" }),
+      /is not a widget on Krea2Image/,
+    );
+  } finally {
+    LiteGraph.createNode = realCreate;
   }
 });
