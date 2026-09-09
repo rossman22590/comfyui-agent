@@ -2040,7 +2040,10 @@ async function exposeWidgetAsInput({ graph, info, node, args }) {
     );
   }
 
-  const { id, renamed } = uniqueInputId(graph, args.input_id || `input_${widgetName}`);
+  // The widget's own name is the input id, as the saved workflows do it:
+  // an "aspect_ratio" widget becomes the "aspect_ratio" input, not
+  // "input_aspect_ratio". uniqueInputId only steps in if that name is taken.
+  const { id, renamed } = uniqueInputId(graph, args.input_id || widgetName);
   const external = LiteGraph.createNode(type);
   if (!external) throw new Error(`expose_input: could not create ${type}`);
   graph.add(external);
@@ -2053,9 +2056,11 @@ async function exposeWidgetAsInput({ graph, info, node, args }) {
   setIfPresent(external, "default_value", widget.value);
 
   // An Enum with no options gives the caller nothing to pick from, so carry
-  // the widget's real choices across — newline separated, as the node expects.
+  // the widget's real choices across. The field is a JSON array string: that is
+  // what saved workflows store and what the run form parses, and a newline list
+  // is read as a single long option.
   const choices = Array.isArray(widget.options?.values) ? widget.options.values : null;
-  if (choices && setIfPresent(external, "options", choices.join("\n"))) {
+  if (choices && setIfPresent(external, "options", JSON.stringify(choices))) {
     // default must be one of them
     setIfPresent(external, "default_value", choices.includes(widget.value) ? widget.value : choices[0]);
   }

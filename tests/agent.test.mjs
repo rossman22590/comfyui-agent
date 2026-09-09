@@ -534,19 +534,26 @@ test("exposing an aspect ratio carries its choices; exposing an image replaces t
     // an aspect ratio: a COMBO whose choices must survive into the Enum
     const sampler = {
       type: "Krea2Image", mode: 0, title: "Krea", pos: [400, 100], size: [300, 200],
-      widgets: [{ name: "aspect_ratio", type: "combo", value: "16:9",
-                  options: { values: ["1:1", "16:9", "9:16"] } }],
+      // the exact choices from a real Krea workflow, labels and all
+      widgets: [{ name: "aspect_ratio", type: "combo", value: "16:9 (Widescreen)",
+                  options: { values: ["1:1 (Square)", "2:3 (Portrait Photo)", "16:9 (Widescreen)"] } }],
       inputs: [{ name: "aspect_ratio", type: "COMBO", link: null }],
       outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
     };
     app.graph.add(sampler);
     const enumResult = await TOOL_IMPL.expose_input({ node: sampler.id, widget: "aspect_ratio" });
     assert.equal(enumResult.exposed.type, "ComfyUIDeployExternalEnum");
-    assert.equal(enumResult.exposed.input_id, "input_aspect_ratio");
-    assert.deepEqual(enumResult.exposed.options, ["1:1", "16:9", "9:16"], "the caller gets the real choices");
+    assert.equal(enumResult.exposed.input_id, "aspect_ratio");
+    assert.deepEqual(enumResult.exposed.options,
+      ["1:1 (Square)", "2:3 (Portrait Photo)", "16:9 (Widescreen)"], "the caller gets the real choices");
     const created = app.graph._nodes.find((n) => n.type === "ComfyUIDeployExternalEnum");
-    assert.equal(created.widgets.find((w) => w.name === "options").value, "1:1\n16:9\n9:16");
-    assert.equal(created.widgets.find((w) => w.name === "default_value").value, "16:9", "the current value stays the default");
+    // a saved workflow stores this as a JSON array string, not a newline list
+    assert.equal(
+      created.widgets.find((w) => w.name === "options").value,
+      '["1:1 (Square)","2:3 (Portrait Photo)","16:9 (Widescreen)"]',
+    );
+    assert.equal(created.widgets.find((w) => w.name === "default_value").value,
+      "16:9 (Widescreen)", "the current value stays the default");
     assert.equal(sampler.inputs[0].link, 1, "and it is actually wired in");
 
     // an input image: the loader is replaced and its consumer rewired
