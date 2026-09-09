@@ -200,6 +200,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "new_workflow",
+            "description": (
+                "Open a NEW, empty workflow tab and switch to it, leaving whatever the user already has "
+                "open untouched. Use this whenever the user asks for a new/another/separate workflow and "
+                "the canvas is not empty — never clear_graph their work to make room. Optionally seeds the "
+                "tab with a workflow. If this frontend has no tab API the canvas is replaced instead and "
+                "the result says so (Undo still restores it), which you must relay to the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Name for the new tab, e.g. 'Video upscaler'."},
+                    "workflow": {"type": "object", "additionalProperties": True, "description": "Optional workflow JSON to seed it with."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "apply_graph_ops",
             "description": (
                 "Edit the live graph with an ordered batch of operations applied as ONE undoable change. Ops:\n"
@@ -400,6 +420,12 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 - open_my_workflow imports into the current canvas; it does not change the Pixio workflow that Commit saves to. Prefer get_my_workflow when copying patterns.
 - MiniMax Music custom nodes may combine loading, generation and decoding in one node. Read the actual node schema; do not impose a generic diffusion pipeline on an all-in-one node. Expose style, lyrics and duration through the exact compatible Deploy external inputs, then connect AUDIO to the installed save node.
 
+# Editing by intent — what the user says vs what the widget wants
+- "Make it N seconds": video length is almost always in FRAMES, not seconds. Find the fps (a CreateVideo/SaveVideo/VHS node's `fps`, else the family's default — Wan 16, LTX/Hunyuan 24, AnimateDiff 8) and set `length`/`num_frames` = round(N x fps). Audio families (Stable Audio, ACE-Step, MiniMax Music) DO take real seconds — set those directly. Say which node and which number you changed, e.g. "SetLength (#12): length 240 = 15s at 16fps".
+- Use find_in_graph to locate the widget instead of guessing: search by name ("length", "duration", "seconds", "fps", "steps", "cfg", "denoise", "width") or by a value the user quoted. On a large graph several nodes may carry the same widget name — change the one on the active path to the output, and say so.
+- "Make it bigger/smaller/HD" → width/height on the empty-latent node, kept to the family's multiple (SD1.5 512 base, SDXL 1024, most video 16-pixel multiples). "More detail" → steps and/or a hires pass, not resolution alone. "Stronger/weaker LoRA" → strength_model/strength_clip. "Different every run" → the seed widget's control_after_generate = randomize.
+- When the user's phrasing maps to several widgets, change the smallest set that achieves it and report exactly what moved.
+
 # Model and node selection — non-negotiable
 - Build with what this machine actually has. list_models is the source of truth for checkpoints, UNETs, LoRAs, VAEs, CLIP/text encoders, ControlNets and upscalers; get_node_type_details gives the exact combo strings. Choose from those lists. Never write a filename you have not seen in a tool result.
 - Prefer LOCAL models and CORE ComfyUI nodes. Do not steer the user toward paid, hosted, partner or API nodes — including PixioGeneration and any other API-backed node — when an installed local model can do the job. There is no promotional interest here: the best workflow for the user is the one that runs on their machine with what they already have.
@@ -415,7 +441,7 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 
 # Rules
 - Never claim a change happened unless the tool result shows it succeeded.
-- Prefer editing the existing graph. clear_graph / load_graph / load_workflow_template only when the user wants a new or replacement workflow.
+- Prefer editing the existing graph. If the user wants a NEW workflow and the canvas already has nodes, call new_workflow first — clear_graph, load_graph and load_workflow_template overwrite what is open, so use them only on an empty canvas or when the user explicitly wants the current one replaced.
 - Don't run_workflow/queue_prompt on an existing graph unless asked; running a workflow you just built to verify it is fine and encouraged when the user asked for something that must work. Don't remove the user's nodes unless asked (cleaning up your own leftovers is fine).
 - If a type or model is missing, say so precisely (what you searched, closest matches) — don't invent.
 - Prefer a Comfy-Org template as the base over building from memory: it is maintained, current, and covers every model family — adapt one rather than inventing a graph, and only assemble from scratch when nothing in the library is close.

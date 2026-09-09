@@ -38,8 +38,11 @@ agent requests, which run on your machine using its OpenRouter key.
   iframe.
 - **It works on what you point at.** Right-click any node → *Ask the agent about
   this node* / *Agent: change this node…*
-- **It remembers.** The conversation survives an editor reload; Undo reverts the
-  agent's last graph change.
+- **It never eats your work.** Asking for a *new* workflow opens a new tab; the
+  canvas you have open is not cleared. Batched edits are one Undo.
+- **It remembers, and it forgets on purpose.** The conversation survives an
+  editor reload, while older tool results are replaced by their summary before
+  each turn so a long build cannot run out of context mid-way.
 
 ## Install
 
@@ -109,7 +112,8 @@ until the model is done.
 
 ### Tools
 
-`get_graph` · `search_node_types` · `get_node_type_details` · `list_models` ·
+`get_graph` · `find_in_graph` · `search_node_types` · `get_node_type_details` ·
+`new_workflow` · `list_models` ·
 `list_pixio_models` · `list_workflow_templates` · `load_workflow_template` ·
 `apply_graph_ops` · `validate_workflow` · `run_workflow` · `focus_node` ·
 `queue_prompt`

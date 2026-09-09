@@ -154,3 +154,67 @@ test("runtime saves Undo and a valid history when the model stream disconnects",
   assert.equal(JSON.parse(tool.content).interrupted, true);
   assert.equal(runtime.store.messages.some((m) => m.streaming), false);
 });
+
+test("long conversations shed old tool bodies and stale previews, never the ordering", async () => {
+  resetGraph();
+  runtime.store.messages = [];
+  runtime.store.undoStack = [];
+  runtime.store.config = { has_key: true };
+
+  // 12 completed calls plus two rendered previews — more than any single turn
+  // needs to keep in full.
+  for (let i = 0; i < 12; i++) {
+    runtime.store.messages.push({ id: `u${i}`, role: "user", content: `step ${i}` });
+    runtime.store.messages.push({
+      id: `a${i}`, role: "assistant", content: "",
+      tool_calls: [{ id: `c${i}`, type: "function", function: { name: "get_graph", arguments: "{}" } }],
+    });
+    runtime.store.messages.push({
+      id: `t${i}`, role: "tool", tool_call_id: `c${i}`, status: "ok",
+      summary: `read graph ${i}`, content: JSON.stringify({ nodes: "x".repeat(4000) }),
+    });
+  }
+  for (const tag of ["old", "new"]) {
+    runtime.store.messages.push({
+      id: `img-${tag}`, role: "user", vision: true,
+      content: [{ type: "text", text: "rendered" }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${tag}` } }],
+    });
+  }
+
+  let sent;
+  globalThis.fetch = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return new Response(new ReadableStream({ start: (c) => c.close() }));
+  };
+  await runtime.sendMessage("continue");
+
+  const tools = sent.messages.filter((m) => m.role === "tool");
+  const elided = tools.filter((m) => JSON.parse(m.content).elided === true);
+  assert.equal(tools.length, 12, "every tool result keeps its slot so calls stay paired");
+  assert.equal(elided.length, 4, "only the newest results are sent in full");
+  assert.match(JSON.parse(elided[0].content).note, /read graph 0/, "an elided result still says what it was");
+  assert.equal(sent.messages.findIndex((m) => m.role === "tool"), 2, "order is untouched");
+
+  const images = sent.messages.filter(
+    (m) => Array.isArray(m.content) && m.content.some((p) => p.type === "image_url"),
+  );
+  assert.equal(images.length, 1, "only the most recent preview is re-sent");
+  assert.equal(images[0].content.at(-1).image_url.url.endsWith("new"), true);
+  assert.equal(sent.messages.some((m) => "__summary" in m || "summary" in m), false, "UI-only fields never reach the model");
+});
+
+test("a display name is resolved to the real class instead of failing", async () => {
+  resetGraph();
+  const real = LiteGraph.createNode;
+  LiteGraph.createNode = (type) => (type === "CheckpointLoaderSimple" ? real(type) : null);
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ CheckpointLoaderSimple: { display_name: "Load Checkpoint", input: {} } }));
+  try {
+    const result = await applyOps([{ op: "add_node", type: "Load Checkpoint" }]);
+    assert.equal(result.failed, 0, "the menu label is not a hard failure");
+    assert.deepEqual(result.results[0].resolved_type, { from: "Load Checkpoint", to: "CheckpointLoaderSimple" });
+    assert.equal(app.graph._nodes[0].type, "CheckpointLoaderSimple");
+  } finally {
+    LiteGraph.createNode = real;
+  }
+});

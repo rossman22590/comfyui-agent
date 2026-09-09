@@ -335,11 +335,85 @@ export async function undoLast() {
 // the loop
 // ---------------------------------------------------------------------------
 
+// A long build is a long conversation: dozens of tool results, some of them
+// tens of kilobytes, plus rendered-image previews. Sent verbatim they exhaust
+// the context window mid-build. Older results are therefore replaced by their
+// one-line summary — the model already acted on them, and anything it still
+// needs it can re-read with get_graph or validate_workflow.
+const KEEP_FULL_TOOL_RESULTS = 8;
+const KEEP_IMAGE_TURNS = 1;
+const WIRE_BUDGET_CHARS = 240_000;
+
+function elideToolResult(message, summary, status) {
+  const detail = summary ? ` (${summary})` : "";
+  return {
+    role: message.role,
+    tool_call_id: message.tool_call_id,
+    content: JSON.stringify({
+      elided: true,
+      note: `Result of an earlier ${status === "error" ? "failed " : ""}call${detail} — re-read the graph if you need it again.`,
+    }),
+  };
+}
+
+function isImageMessage(message) {
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((part) => part?.type === "image_url")
+  );
+}
+
+function stripImages(message) {
+  return {
+    ...message,
+    content: [
+      ...message.content.filter((part) => part?.type !== "image_url"),
+      { type: "text", text: "[earlier preview image omitted]" },
+    ],
+  };
+}
+
 function wireMessages() {
   // strip UI-only fields before sending to the model
-  return store.messages.map(
-    ({ id, reasoning, status, summary, streaming, error, mutating, live, vision, ...rest }) => rest,
+  const wire = store.messages.map(
+    ({ id, reasoning, status, summary, streaming, error, mutating, live, vision, ...rest }) => ({
+      ...rest,
+      // keep these two for the elision pass, then drop them below
+      __status: status,
+      __summary: summary,
+    }),
   );
+
+  let toolsKept = 0;
+  let imagesKept = 0;
+  let budget = WIRE_BUDGET_CHARS;
+
+  // newest first: the most recent results are the ones still being reasoned about
+  for (let i = wire.length - 1; i >= 0; i--) {
+    const message = wire[i];
+    const size = typeof message.content === "string" ? message.content.length : 2000;
+
+    if (message.role === "tool") {
+      const keep = toolsKept < KEEP_FULL_TOOL_RESULTS && budget - size > 0;
+      if (keep) {
+        toolsKept++;
+        budget -= size;
+      } else {
+        wire[i] = elideToolResult(message, message.__summary, message.__status);
+      }
+      continue;
+    }
+
+    if (isImageMessage(message)) {
+      if (imagesKept < KEEP_IMAGE_TURNS) imagesKept++;
+      else wire[i] = stripImages(message);
+      continue;
+    }
+
+    budget -= size;
+  }
+
+  return wire.map(({ __status, __summary, ...rest }) => rest);
 }
 
 function sessionContext() {

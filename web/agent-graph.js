@@ -112,6 +112,37 @@ function detailInputs(def, comboLimit, comboFilter) {
   return result;
 }
 
+let displayNameIndex = null;
+
+const normalizeTypeKey = (value) =>
+  String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/**
+ * Map whatever the model wrote onto a real class name.
+ *
+ * Node menus show display names ("Load Checkpoint") so that is often what a
+ * model emits, while LiteGraph only answers to class names
+ * ("CheckpointLoaderSimple"). Resolving here turns the single most common
+ * hallucination into a non-event.
+ */
+async function resolveNodeType(type) {
+  if (!type) return null;
+  if (LiteGraph.registered_node_types?.[type]) return type;
+  const info = await getObjectInfo();
+  if (info[type]) return type;
+
+  if (!displayNameIndex) {
+    displayNameIndex = new Map();
+    for (const [className, def] of Object.entries(info)) {
+      // a real class name always wins over someone else's display name
+      const display = normalizeTypeKey(def?.display_name);
+      if (display && !displayNameIndex.has(display)) displayNameIndex.set(display, className);
+      displayNameIndex.set(normalizeTypeKey(className), className);
+    }
+  }
+  return displayNameIndex.get(normalizeTypeKey(type)) ?? null;
+}
+
 function scoreNodeDef(type, def, tokens) {
   const name = type.toLowerCase();
   const display = String(def.display_name ?? "").toLowerCase();
@@ -625,7 +656,16 @@ async function applyOne(op, index, ctx) {
       case "add_node": {
         if (!op.type) throw new Error("add_node requires `type`");
         if (op.ref && refs.has(String(op.ref))) throw new Error(`duplicate node ref "${op.ref}"`);
-        const node = LiteGraph.createNode(op.type);
+        let node = LiteGraph.createNode(op.type);
+        if (!node) {
+          // menus show display names ("Load Checkpoint"), LiteGraph wants the
+          // class name — resolve rather than fail
+          const resolved = await resolveNodeType(op.type);
+          if (resolved && resolved !== op.type) {
+            node = LiteGraph.createNode(resolved);
+            if (node) res.resolved_type = { from: op.type, to: resolved };
+          }
+        }
         if (!node) {
           const s = await searchNodeTypes({ query: op.type.replace(/([a-z])([A-Z])/g, "$1 $2"), limit: 5 });
           throw new Error(
