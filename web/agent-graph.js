@@ -774,6 +774,45 @@ async function showOp(op, res) {
 // ---------------------------------------------------------------------------
 
 /** Per-batch mutable state: refs created so far, layout cursor, warnings, results. */
+// ---------------------------------------------------------------------------
+// noticing the user editing while we build
+// ---------------------------------------------------------------------------
+//
+// The agent streams ops onto a canvas the user is watching and can touch. If
+// they rewire a sampler mid-build, the ops that follow were planned against a
+// graph that no longer exists — and can quietly undo their change.
+//
+// The signature below deliberately covers STRUCTURE only: node ids, types,
+// modes, widget values and links. Not position, size, colour, collapsed state
+// or the viewport. Two reasons: dragging a node aside to watch is not an edit
+// worth aborting for, and the agent's own "just landed" highlight writes
+// node.boxcolor, which a naive serialize-and-hash would read as the user
+// editing — an earlier attempt at this aborted every batch after its own
+// first op for exactly that reason.
+
+function structuralSignature(graph = app.graph) {
+  const parts = [];
+  const walk = (g) => {
+    for (const node of [...nodesOf(g)].sort((a, b) => (a.id ?? 0) - (b.id ?? 0))) {
+      const widgets = (node.widgets ?? [])
+        .filter((w) => w.type !== "converted-widget" && !w.name?.startsWith("$$"))
+        .map((w) => `${w.name}=${typeof w.value === "object" ? "[obj]" : w.value}`);
+      const inputs = (node.inputs ?? []).map((i) => `${i.name}:${i.link ?? "-"}`);
+      parts.push(`${node.id}|${node.type}|${node.mode ?? 0}|${widgets.join(",")}|${inputs.join(",")}`);
+      if (isSubgraphNode(node)) walk(node.subgraph);
+    }
+  };
+  walk(graph);
+  // FNV-1a: short, stable, and cheap enough to run between ops
+  let hash = 0x811c9dc5;
+  const text = parts.join(";");
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${(hash >>> 0).toString(36)}.${parts.length}`;
+}
+
 function createOpsContext() {
   return {
     refs: new Map(),
@@ -782,6 +821,9 @@ function createOpsContext() {
     results: [],
     failed: 0,
     snapshot: null,
+    // what the graph looked like when we last touched it; anything else that
+    // changes it between ops came from the user
+    signature: null,
   };
 }
 
@@ -791,6 +833,15 @@ async function applyOne(op, index, ctx) {
   const res = { index, op: op?.op, ok: true };
   op = op ?? {};
   try {
+    // Once the user has touched the graph, every remaining op was planned
+    // against something that no longer exists — refuse them all, not just the
+    // one that noticed.
+    if (ctx.userEdited || (ctx.signature && structuralSignature() !== ctx.signature)) {
+      ctx.userEdited = true;
+      throw new Error(
+        "the user changed the canvas while this batch was running, so this and the remaining ops were not applied — re-read with get_graph and continue from what is actually there",
+      );
+    }
     // ops address the root graph unless they name a subgraph node
     const { graph, scope } = graphFor(op.target);
     if (scope !== "root") res.target = scope;
@@ -994,6 +1045,12 @@ async function applyOne(op, index, ctx) {
   }
   if (!res.ok) ctx.failed++;
   ctx.results.push(res);
+  // Baseline the moment OUR mutation is done and before the pause that lets
+  // the user act: anything that changes the graph during showOp's beat is
+  // theirs, and the next op will see it. Re-baselining after the pause would
+  // quietly absorb exactly the edit we are trying to catch. The highlight
+  // showOp paints is cosmetic and outside the signature, so it never counts.
+  if (!ctx.userEdited) ctx.signature = structuralSignature();
   await showOp(op, res);
   return res;
 }
@@ -1002,6 +1059,12 @@ function opsResult(ctx) {
   return {
     applied: ctx.results.length - ctx.failed,
     failed: ctx.failed,
+    ...(ctx.userEdited
+      ? {
+          user_edited_canvas: true,
+          note: "The user edited the graph mid-batch. Everything before that point was applied and is kept. Re-read the graph before doing anything else, and do not assume the ids you planned with are still right.",
+        }
+      : {}),
     warnings: ctx.warnings,
     results: ctx.results,
     refs: Object.fromEntries([...ctx.refs.entries()].map(([k, n]) => [k, n.id])),
@@ -1018,6 +1081,7 @@ async function applyOps(ops = []) {
   if (!Array.isArray(ops)) throw new Error("ops must be an array");
   const ctx = createOpsContext();
   ctx.snapshot = structuredClone(app.graph.serialize());
+  ctx.signature = structuralSignature();
 
   app.graph.beforeChange();
   try {
@@ -1778,6 +1842,85 @@ async function checkNodesAvailable({ types = [] } = {}) {
 }
 
 TOOL_IMPL.check_nodes_available = async (args) => checkNodesAvailable(args);
+
+// ---------------------------------------------------------------------------
+// seeing the canvas, not just reading it
+// ---------------------------------------------------------------------------
+//
+// get_graph describes structure; it says nothing about whether the result
+// LOOKS right. Two things fix that. Overlap and reach are arithmetic, so they
+// are computed exactly rather than guessed at from a picture. Everything else
+// — is this readable, does it look like a mess — needs the picture, so the
+// canvas is captured and handed to the model the same way a rendered output is.
+
+function layoutProblems(graph = app.graph) {
+  const nodes = nodesOf(graph).filter((n) => Array.isArray(n.pos) && Array.isArray(n.size));
+  const box = (n) => ({
+    left: n.pos[0], top: n.pos[1] - 26, // the title bar sits above pos
+    right: n.pos[0] + (n.size[0] ?? 0), bottom: n.pos[1] + (n.size[1] ?? 0),
+  });
+  const overlaps = [];
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = box(nodes[i]);
+      const b = box(nodes[j]);
+      if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+        overlaps.push({
+          nodes: [nodes[i].id, nodes[j].id],
+          titles: [nodes[i].title ?? nodes[i].type, nodes[j].title ?? nodes[j].type],
+        });
+      }
+    }
+  }
+  // a node wired right-to-left reads as a tangle however it is drawn
+  const backwards = [];
+  for (const node of nodes) {
+    for (const input of node.inputs ?? []) {
+      const link = linkById(input.link, graph);
+      const source = link && graph.getNodeById?.(link.origin_id);
+      if (source?.pos && source.pos[0] > node.pos[0] + 40) {
+        backwards.push({ from: source.id, to: node.id, input: input.name });
+      }
+    }
+  }
+  return { overlapping: overlaps.slice(0, 12), backwards_links: backwards.slice(0, 12) };
+}
+
+/** The canvas as the user sees it, small enough to send. */
+export async function canvasImage(maxEdge = 1100, quality = 0.72) {
+  const source = app.canvas?.canvas;
+  if (!source?.width) throw new Error("the canvas is not available to capture");
+  const scale = Math.min(1, maxEdge / Math.max(source.width, source.height));
+  const width = Math.max(1, Math.round(source.width * scale));
+  const height = Math.max(1, Math.round(source.height * scale));
+  const target =
+    typeof OffscreenCanvas === "function"
+      ? new OffscreenCanvas(width, height)
+      : Object.assign(document.createElement("canvas"), { width, height });
+  const ctx = target.getContext("2d");
+  ctx.drawImage(source, 0, 0, width, height);
+  if (target.convertToBlob) {
+    const blob = await target.convertToBlob({ type: "image/jpeg", quality });
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("could not encode the canvas"));
+      reader.readAsDataURL(blob);
+    });
+  }
+  return target.toDataURL("image/jpeg", quality);
+}
+
+TOOL_IMPL.view_canvas = async () => {
+  const problems = layoutProblems();
+  return {
+    ...problems,
+    tidy:
+      problems.overlapping.length === 0 && problems.backwards_links.length === 0,
+    screenshot_attached: true,
+    note: "The canvas image follows this result. Overlaps and right-to-left links above are measured, not guessed — fix those with set_pos or arrange. Judge readability from the picture.",
+  };
+};
 
 TOOL_IMPL.find_in_graph = async (args) => findInGraph(args);
 TOOL_IMPL.new_workflow = async (args) => newWorkflow(args);

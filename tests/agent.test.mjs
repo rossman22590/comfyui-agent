@@ -447,3 +447,51 @@ test("a loaded template says which model files are absent, without being asked",
   assert.deepEqual(result.missing_models[0].installed_options, OPTIONS, "and what to use instead");
   assert.match(result.note, /NOT runnable/);
 });
+
+test("a user edit mid-batch stops the build; our own highlight does not", async () => {
+  resetGraph();
+  storage.set("pixio-agent.speed", "instant");
+
+  // the agent's own effects must never read as the user editing: flash() sets
+  // node.boxcolor, panTo moves the viewport, and every add_node sets pos
+  const cosmetic = await applyOps([
+    { op: "add_node", type: "KSampler", ref: "a" },
+    { op: "add_node", type: "KSampler", ref: "b" },
+    { op: "set_title", node: "a", title: "Renamed" },
+  ]);
+  assert.equal(cosmetic.failed, 0, "a normal batch runs to the end");
+  assert.equal(cosmetic.user_edited_canvas, undefined);
+
+  // now the user rewires something between two ops
+  resetGraph();
+  const victim = { type: "KSampler", mode: 0, title: "KSampler", pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [], widgets: [{ name: "steps", type: "number", value: 20, options: {} }] };
+  app.graph.add(victim);
+
+  // the user acts during the beat between ops, which is when the canvas is
+  // actually theirs to touch — setDirtyCanvas runs inside that pause
+  const realDirty = app.graph.setDirtyCanvas.bind(app.graph);
+  let interfered = false;
+  app.graph.setDirtyCanvas = (...args) => {
+    realDirty(...args);
+    if (!interfered && app.graph._nodes.length >= 2) {
+      interfered = true;
+      victim.widgets[0].value = 8; // the user turns the steps down
+      if (process.env.TRACE) console.log("  [user edited at", app.graph._nodes.length, "nodes]");
+    }
+  };
+  try {
+    const clash = await applyOps([
+      { op: "add_node", type: "KSampler", ref: "x" },
+      { op: "add_node", type: "KSampler", ref: "y" },
+      { op: "add_node", type: "KSampler", ref: "z" },
+    ]);
+    assert.equal(clash.user_edited_canvas, true, "the interference is noticed");
+    assert.equal(clash.applied, 1, "what landed before it is kept");
+    assert.equal(clash.failed, 2, "the rest are refused rather than applied blind");
+    assert.match(clash.results[1].error, /changed the canvas/);
+    assert.equal(victim.widgets[0].value, 8, "the user's change survives untouched");
+  } finally {
+    app.graph.setDirtyCanvas = realDirty;
+  }
+});

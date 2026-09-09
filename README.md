@@ -46,6 +46,13 @@ agent requests, which run on your machine using its OpenRouter key.
   does not have, it names the pack and its GitHub URL (from the ComfyUI-Manager
   index) instead of building a graph that fails on Run — and offers the best
   workflow it can build from what you do have.
+- **It notices you.** If you rewire a node while it is building, the batch stops
+  at that point instead of overwriting you: what landed is kept, the rest is
+  refused, and it re-reads before continuing. The check covers structure only,
+  so nudging a node aside to watch is not mistaken for an edit.
+- **It looks at the graph.** `view_canvas` measures overlapping nodes and
+  backwards links, and hands the model a picture of the canvas, so "this looks
+  like a mess" is something it can see rather than something it has to be told.
 - **It never eats your work.** Asking for a *new* workflow opens a new tab; the
   canvas you have open is not cleared. Batched edits are one Undo.
 - **The chat belongs to the workflow.** It is saved on the machine — on your

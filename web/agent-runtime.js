@@ -16,6 +16,7 @@ import { app } from "../../scripts/app.js";
 import {
   TOOL_IMPL,
   MUTATING_TOOLS,
+  canvasImage,
   createStreamingApplier,
   graphSummary,
   imagesFromRun,
@@ -741,10 +742,13 @@ export async function sendMessage(text) {
       }
       active = null;
       if (pendingVision.length && visionEnabled()) {
-        const parts = [{ type: "text", text: "Rendered outputs. Check against the user's request and fix clear failures before claiming success." }];
+        const parts = [{ type: "text", text: "Images from the last step. A rendered output: check it against the user's request and say plainly if it is wrong rather than confirming a bad result. The canvas: judge whether the graph reads clearly — nodes stacked on each other, links doubling back, anything the user would call a mess — and tidy it if so." }];
         for (const file of pendingVision) {
           signal.throwIfAborted();
-          try { parts.push({ type: "image_url", image_url: { url: await outputImageDataUrl(file) } }); }
+          try {
+            const url = file.canvas ? await canvasImage() : await outputImageDataUrl(file);
+            parts.push({ type: "image_url", image_url: { url } });
+          }
           catch (error) { console.warn("[pixio-agent] preview unavailable", error); }
         }
         if (parts.length > 1) push({ role: "user", content: parts, vision: true, summary: "rendered output" });
