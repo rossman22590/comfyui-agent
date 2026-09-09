@@ -269,7 +269,76 @@ test("a subgraph is visible, readable and editable through its target", async ()
   // a bad target must fail loudly instead of silently editing the root
   const wrong = await applyOps([{ op: "add_node", target: 9999, type: "KSampler" }]);
   assert.equal(wrong.failed, 1);
-  assert.match(wrong.results[0].error, /not a node in the root graph/);
+  assert.match(wrong.results[0].error, /not a node in this workflow or any of its subgraphs/);
   const notASubgraph = await applyOps([{ op: "add_node", target: host.id + 500, type: "KSampler" }]);
   assert.equal(notASubgraph.failed, 1);
+});
+
+test("a subgraph nested inside another subgraph is reachable", async () => {
+  resetGraph();
+  // depth 2: root -> outer -> inner. Ids are per-graph, so the inner host
+  // deliberately reuses an id that also exists at the root.
+  const makeGraph = (nodes = []) => {
+    let next = 500;
+    const g = {
+      _nodes: [...nodes], _groups: [],
+      add(node) { node.id = ++next; g._nodes.push(node); },
+      getNodeById(id) { return g._nodes.find((n) => n.id === id); },
+      remove(node) { g._nodes = g._nodes.filter((n) => n !== node); },
+      setDirtyCanvas() {},
+    };
+    return g;
+  };
+  const innerGraph = makeGraph();
+  innerGraph.add({ type: "KSampler", mode: 0, title: "Deep", pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [], widgets: [{ name: "steps", type: "number", value: 5, options: {} }] });
+
+  const innerHost = { id: 42, type: "Inner", mode: 0, title: "Inner", pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [], widgets: [], subgraph: innerGraph };
+  const outerGraph = makeGraph([innerHost]);
+  const outerHost = { type: "Outer", mode: 0, title: "Outer", pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [], widgets: [], subgraph: outerGraph };
+  app.graph.add(outerHost);
+  // a root node sharing the nested host's id — the shallow search must not win
+  app.graph.add({ type: "Decoy", mode: 0, title: "Decoy", pos: [0, 0], size: [10, 10],
+    inputs: [], outputs: [], widgets: [] });
+
+  const deep = await TOOL_IMPL.get_graph({ target: 42 });
+  assert.equal(deep.nodes[0].title, "Deep", "reading a depth-2 subgraph reaches its nodes");
+
+  const edited = await applyOps([
+    { op: "set_widgets", target: 42, node: innerGraph._nodes[0].id, widgets: { steps: 12 } },
+  ]);
+  assert.equal(edited.failed, 0, "a depth-2 target is editable");
+  assert.equal(innerGraph._nodes[0].widgets[0].value, 12);
+  assert.equal(app.graph._nodes.length, 2, "the root graph is untouched");
+});
+
+test("a saved conversation survives a reload", async () => {
+  // the regression this guards: restore() called an undefined storageKey(),
+  // the ReferenceError was swallowed by a bare catch, and the next message
+  // overwrote the good record — the chat silently started blank every time.
+  resetGraph();
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => store.get(k) ?? null,
+    setItem: (k, v) => store.set(k, v),
+  };
+  runtime.store.messages = [
+    { id: "u1", role: "user", content: "build me a music workflow" },
+    { id: "a1", role: "assistant", content: "done" },
+  ];
+  runtime.store.usage = { prompt_tokens: 10, completion_tokens: 20, turns: 1 };
+  runtime.persist();
+
+  const saved = [...store.keys()];
+  assert.equal(saved.length, 1, "persist writes exactly one record");
+  assert.ok(JSON.parse(store.get(saved[0])).messages.length === 2);
+
+  runtime.store.messages = [];
+  runtime.store.usage = { prompt_tokens: 0, completion_tokens: 0, turns: 0 };
+  runtime.restore();
+  assert.equal(runtime.store.messages.length, 2, "the conversation comes back");
+  assert.equal(runtime.store.messages[0].content, "build me a music workflow");
+  assert.equal(runtime.store.usage.turns, 1, "usage comes back too");
 });

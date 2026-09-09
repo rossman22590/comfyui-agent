@@ -65,7 +65,7 @@ function activateWorkspace(context) {
   emit({ type: "reset-view" });
 }
 
-function persist() {
+export function persist() {
   try {
     localStorage.setItem(
       STORAGE_KEY,
@@ -76,17 +76,19 @@ function persist() {
   }
 }
 
-function restore() {
+export function restore() {
   try {
-    const raw = localStorage.getItem(storageKey());
+    const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const saved = JSON.parse(raw);
     // a stale conversation is more confusing than helpful
     if (!saved?.messages?.length || Date.now() - (saved.at ?? 0) > 12 * 3600 * 1000) return;
     store.messages = saved.messages;
     store.usage = saved.usage ?? store.usage;
-  } catch {
-    // ignore corrupt state
+  } catch (e) {
+    // a bare catch here hid a ReferenceError through a whole day of work: a
+    // conversation that cannot be restored is worth one line of console
+    console.warn("[pixio-agent] could not restore the saved conversation", e);
   }
 }
 

@@ -266,15 +266,42 @@ function nodesOf(graph) {
   return graph?._nodes ?? graph?.nodes ?? [];
 }
 
+/**
+ * Find the node `id` names, searching the root graph and every graph nested
+ * inside it. Node ids are unique per LGraph, not globally, so a subgraph one
+ * level down can reuse a root id — breadth-first keeps the shallowest match,
+ * and a subgraph host wins over a plain node because that is what `target`
+ * has to resolve to.
+ */
+function findHostById(id) {
+  const queue = [app.graph];
+  const seen = new Set();
+  let fallback = null;
+  while (queue.length) {
+    const graph = queue.shift();
+    if (!graph || seen.has(graph)) continue;
+    seen.add(graph);
+    const hit = graph.getNodeById?.(id);
+    if (hit) {
+      if (isSubgraphNode(hit)) return hit;
+      fallback ??= hit; // keep it so the "not a subgraph" error still fires
+    }
+    for (const node of nodesOf(graph)) {
+      if (isSubgraphNode(node)) queue.push(node.subgraph);
+    }
+  }
+  return fallback;
+}
+
 /** Resolve a `target` to a graph. Throws with a usable message when it can't. */
 function graphFor(target) {
   if (target == null || target === "root") {
     return { graph: app.graph, scope: "root" };
   }
   const id = Number(target);
-  const host = Number.isNaN(id) ? null : app.graph.getNodeById(id);
+  const host = Number.isNaN(id) ? null : findHostById(id);
   if (!host) {
-    throw new Error(`target "${target}" is not a node in the root graph — pass a subgraph node's id, or omit target for the root graph`);
+    throw new Error(`target "${target}" is not a node in this workflow or any of its subgraphs — pass a subgraph node's id, or omit target for the root graph`);
   }
   if (!isSubgraphNode(host)) {
     throw new Error(`node ${host.id} (${host.type}) is not a subgraph, so it has no inner graph to target`);
