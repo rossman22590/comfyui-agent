@@ -1860,6 +1860,114 @@ function findInGraph({ query, widget, type, limit = 20, target, include_subgraph
   };
 }
 
+// ---------------------------------------------------------------------------
+// the other tabs
+// ---------------------------------------------------------------------------
+//
+// app.graph is whichever workflow has focus, so every other tool here sees one
+// of the user's open workflows and has no idea the rest exist. Someone with
+// three tabs open asking "which of these has the upscaler" was being answered
+// from the one already in front of them.
+//
+// An opened tab carries its own serialized state, so the others can be
+// summarised without switching to them: reading should not move what the user
+// is looking at.
+
+function workflowService() {
+  return app.extensionManager?.workflow ?? null;
+}
+
+function summariseState(state) {
+  const nodes = state?.nodes;
+  if (!Array.isArray(nodes)) return {};
+  const counts = {};
+  for (const node of nodes) {
+    if (node?.type) counts[node.type] = (counts[node.type] ?? 0) + 1;
+  }
+  return {
+    node_count: nodes.length,
+    // enough to recognise a workflow without pulling a whole graph across
+    main_nodes: Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([type, n]) => (n > 1 ? `${type} x${n}` : type)),
+  };
+}
+
+function describeWorkflow(wf, index, active) {
+  const path = wf?.path ?? wf?.key ?? "";
+  return {
+    index,
+    name: wf?.filename ?? String(path).split("/").pop() ?? `workflow ${index}`,
+    path,
+    active: wf === active,
+    modified: !!wf?.isModified,
+    unsaved: !!wf?.isTemporary,
+    ...(wf === active
+      ? summariseState(app.graph?.serialize?.())
+      : summariseState(wf?.activeState)),
+  };
+}
+
+function listOpenWorkflows() {
+  const service = workflowService();
+  const open = service?.openWorkflows;
+  if (!Array.isArray(open)) {
+    return {
+      supported: false,
+      note: "this ComfyUI frontend does not expose its open workflows, so only the one on the canvas can be seen",
+    };
+  }
+  const active = service.activeWorkflow;
+  const workflows = open.map((wf, i) => describeWorkflow(wf, i, active));
+  return {
+    open: workflows,
+    active: workflows.find((w) => w.active)?.name ?? null,
+    ...(workflows.length < 2
+      ? { note: "only one workflow is open" }
+      : {
+          note: "get_graph and every edit apply to the active one; switch_workflow moves to another tab first. A tab with no node_count has not been opened this session, so only its name is known.",
+        }),
+  };
+}
+
+async function switchWorkflow({ workflow } = {}) {
+  const service = workflowService();
+  const open = service?.openWorkflows;
+  if (!Array.isArray(open) || typeof service.openWorkflow !== "function") {
+    throw new Error("switch_workflow: this ComfyUI frontend does not expose its open workflows");
+  }
+  if (workflow === undefined || workflow === null || workflow === "") {
+    throw new Error("switch_workflow requires `workflow` — an index or a name from list_open_workflows");
+  }
+  const wanted = String(workflow).toLowerCase();
+  const asIndex = Number(workflow);
+  const target =
+    (Number.isInteger(asIndex) && String(asIndex) === String(workflow) ? open[asIndex] : null) ??
+    open.find((wf) => String(wf?.filename ?? "").toLowerCase() === wanted) ??
+    open.find((wf) => String(wf?.path ?? "").toLowerCase() === wanted) ??
+    open.find((wf) => String(wf?.filename ?? wf?.path ?? "").toLowerCase().includes(wanted));
+  if (!target) {
+    const names = open.map((wf, i) => `${i}: ${wf?.filename ?? wf?.path}`).join(", ");
+    throw new Error(`switch_workflow: no open workflow matches "${workflow}". Open: ${names}`);
+  }
+  if (target === service.activeWorkflow) {
+    return {
+      switched: false,
+      active: target.filename ?? target.path,
+      note: "that workflow was already in front",
+    };
+  }
+  await service.openWorkflow(target);
+  redraw();
+  return {
+    switched: true,
+    active: target.filename ?? target.path,
+    node_count: (app.graph?._nodes ?? []).length,
+    note: "the user is now looking at this workflow, and edits from here apply to it",
+  };
+}
+
 /**
  * Open a brand-new workflow tab. A request for a *new* workflow must never
  * wipe what the user already has open, so this uses the frontend's workflow
@@ -2499,6 +2607,11 @@ TOOL_IMPL.read_notes = async (args) => {
 TOOL_IMPL.find_in_graph = async (args) => findInGraph(args);
 TOOL_IMPL.new_workflow = async (args) => newWorkflow(args);
 MUTATING_TOOLS.add("new_workflow");
+
+TOOL_IMPL.list_open_workflows = async () => listOpenWorkflows();
+TOOL_IMPL.switch_workflow = async (args) => switchWorkflow(args ?? {});
+// moves what the user is looking at, which the UI should say happened
+MUTATING_TOOLS.add("switch_workflow");
 
 TOOL_IMPL.run_workflow = async (args) => runWorkflow(args);
 MUTATING_TOOLS.add("run_workflow");

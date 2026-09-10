@@ -914,3 +914,73 @@ test("a graph our own validator calls broken is never queued", async () => {
     "the reason is the one our validator gave",
   );
 });
+
+test("with three workflows open the agent sees all three, not just the one in front", async () => {
+  forgetObjectInfo();
+  resetGraph();
+  // what the frontend's workflow store exposes: the open tabs and the active one
+  const upscaler = {
+    filename: "video-upscaler.json", path: "workflows/video-upscaler.json",
+    isModified: true, isTemporary: false,
+    activeState: { nodes: [{ type: "UpscaleModelLoader" }, { type: "ImageUpscaleWithModel" }, { type: "SaveImage" }] },
+  };
+  const music = {
+    filename: "minimax-music.json", path: "workflows/minimax-music.json",
+    isModified: false, isTemporary: false,
+    activeState: { nodes: [{ type: "MinimaxMusic" }, { type: "SaveAudio" }] },
+  };
+  const scratch = { filename: "Unsaved Workflow.json", path: "unsaved", isTemporary: true, activeState: null };
+  let active = music;
+  app.extensionManager = {
+    workflow: {
+      openWorkflows: [upscaler, music, scratch],
+      get activeWorkflow() { return active; },
+      openWorkflow: async (wf) => { active = wf; },
+    },
+  };
+  app.graph.add({ type: "MinimaxMusic", mode: 0, title: "Music", pos: [0, 0], size: [200, 60],
+    widgets: [], inputs: [], outputs: [] });
+
+  try {
+    const listed = await TOOL_IMPL.list_open_workflows();
+    assert.equal(listed.open.length, 3, "all three tabs, not just the focused one");
+    assert.equal(listed.active, "minimax-music.json");
+
+    const byName = Object.fromEntries(listed.open.map((w) => [w.name, w]));
+    // the inactive tabs are summarised from their own saved state, without
+    // switching to them — reading must not move what the user is looking at
+    assert.equal(byName["video-upscaler.json"].node_count, 3);
+    assert.ok(byName["video-upscaler.json"].main_nodes.includes("UpscaleModelLoader"),
+      "enough detail to answer 'which one has the upscaler'");
+    assert.equal(byName["video-upscaler.json"].modified, true);
+    assert.equal(byName["Unsaved Workflow.json"].unsaved, true);
+    assert.equal(active, music, "and nothing was switched just to look");
+
+    // the active tab is summarised from the live canvas, not a stale snapshot
+    assert.equal(byName["minimax-music.json"].node_count, 1);
+
+    const moved = await TOOL_IMPL.switch_workflow({ workflow: "upscaler" });
+    assert.equal(moved.switched, true, "a partial name is enough to find it");
+    assert.equal(active, upscaler);
+
+    const again = await TOOL_IMPL.switch_workflow({ workflow: 0 });
+    assert.equal(again.switched, false, "already in front, so nothing moved");
+
+    await assert.rejects(
+      () => TOOL_IMPL.switch_workflow({ workflow: "nothing-like-this" }),
+      /no open workflow matches.*video-upscaler/s,
+      "and a miss lists what is actually open",
+    );
+  } finally {
+    app.extensionManager = undefined;
+  }
+});
+
+test("an older frontend with no tab API says so instead of pretending", async () => {
+  resetGraph();
+  app.extensionManager = undefined;
+  const listed = await TOOL_IMPL.list_open_workflows();
+  assert.equal(listed.supported, false);
+  assert.match(listed.note, /only the one on the canvas/);
+  await assert.rejects(() => TOOL_IMPL.switch_workflow({ workflow: 0 }), /does not expose/);
+});
