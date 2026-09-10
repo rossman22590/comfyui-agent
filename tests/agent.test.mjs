@@ -640,7 +640,9 @@ test("an external input is picked by what the socket accepts, and never faked", 
     // nothing. Refusing outright is the only honest answer.
     await assert.rejects(
       () => TOOL_IMPL.expose_input({ node: node.id, widget: "cfg" }),
-      /does not accept|not installed/,
+      // and the refusal names the socket and what it tried, so the agent can
+      // tell the user what is missing rather than retrying blindly
+      /nothing installed here can drive a FLOAT socket.*NumberInt/s,
     );
     assert.ok(asked.length > 0, "the graph's own compatibility rule was consulted");
     assert.equal(

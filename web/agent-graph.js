@@ -2040,8 +2040,7 @@ function externalCandidates(node, widget) {
  * socket is the point — a fallback that cannot connect leaves a dead node on
  * the canvas, and the old code reported that as a success.
  */
-function externalTypeForWidget(node, widget, info) {
-  const socket = (node.inputs ?? []).find((i) => i.name === widget?.name);
+function externalTypeForWidget(node, widget, info, socket) {
   const installed = externalCandidates(node, widget)
     .map((suffix) => deployNodeType(suffix, info))
     .filter(Boolean);
@@ -2104,10 +2103,25 @@ async function exposeWidgetAsInput({ graph, info, node, args }) {
     );
   }
 
-  const type = externalTypeForWidget(node, widget, info);
-  if (!type) {
+  // Resolve the socket first. findInputSlot is what the connection will use —
+  // it matches case-insensitively and converts a widget that has no socket yet
+  // — so choosing a type against a socket found any other way risks picking for
+  // one socket and wiring into another.
+  const inIdx = findInputSlot(node, widgetName);
+  if (inIdx < 0) {
     throw new Error(
-      "expose_input: the ComfyUI Deploy external input nodes are not installed on this machine, so the workflow cannot take API inputs",
+      `expose_input: "${widgetName}" on ${node.type} (#${node.id}) has no input socket to drive. ${describeSlots(node)}`,
+    );
+  }
+  const socket = node.inputs[inIdx];
+
+  const type = externalTypeForWidget(node, widget, info, socket);
+  if (!type) {
+    const options = externalCandidates(node, widget)
+      .map((suffix) => `${DEPLOY_INPUT_PREFIX}${suffix}`)
+      .join(", ");
+    throw new Error(
+      `expose_input: nothing installed here can drive a ${socket.type ?? "?"} socket for "${widgetName}". Tried ${options}. Either the ComfyUI Deploy nodes are missing from this machine, or none of them outputs a type that socket accepts.`,
     );
   }
 
@@ -2139,13 +2153,6 @@ async function exposeWidgetAsInput({ graph, info, node, args }) {
   if (widget.options?.min !== undefined) setIfPresent(external, "min_value", widget.options.min);
   if (widget.options?.max !== undefined) setIfPresent(external, "max_value", widget.options.max);
 
-  const inIdx = findInputSlot(node, widgetName);
-  if (inIdx < 0) {
-    graph.remove(external);
-    throw new Error(
-      `expose_input: "${widgetName}" on ${node.type} (#${node.id}) has no input socket to drive. ${describeSlots(node)}`,
-    );
-  }
   // connect() declines a type it cannot take and says so only in its return
   // value, so check the socket itself: a node left sitting there unwired, with
   // the tool reporting success, is worse than a clear failure.
