@@ -314,3 +314,67 @@ class TemperatureCapabilityTests(unittest.TestCase):
 
     def test_openrouter_keeps_its_hint_because_it_normalises_upstream(self):
         self.assertTrue(self.decide("openrouter", {}))
+
+
+class ProviderKeyEnvTests(unittest.TestCase):
+    """The settings panel names a machine secret; it has to be the right one.
+
+    Each provider reads a different variable, and the panel used to say
+    OPENROUTER_API_KEY whichever one was selected — sending anyone on Machine
+    off to set a secret the agent would never look at.
+    """
+
+    def setUp(self):
+        self.source = (ROOT / "agent_routes.py").read_text(encoding="utf-8")
+
+    def _provider_entries(self):
+        """The provider dicts the config route hands the UI."""
+        tree = ast.parse(self.source)
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+            if "id" in keys and "key_prefix" in keys:
+                entry = {}
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and isinstance(value, ast.Constant):
+                        entry[key.value] = value.value
+                found.append(entry)
+        return found
+
+    def test_every_provider_names_its_own_env_var(self):
+        entries = self._provider_entries()
+        self.assertEqual({e["id"] for e in entries}, {"openrouter", "machine"})
+        by_id = {e["id"]: e for e in entries}
+        self.assertEqual(by_id["openrouter"]["key_env"], "OPENROUTER_API_KEY")
+        self.assertEqual(by_id["machine"]["key_env"], "PIXIO_AGENT_API_KEY")
+
+    def test_the_named_var_is_one_the_resolver_actually_reads(self):
+        """A name nothing reads is worse than no name at all."""
+        for entry in self._provider_entries():
+            self.assertIn(
+                entry["key_env"],
+                self.source,
+                f"{entry['id']} points at {entry['key_env']}, which this module never reads",
+            )
+
+
+class PanelWordingTests(unittest.TestCase):
+    """The panel must not hard-code one provider's wording."""
+
+    def setUp(self):
+        panel = (
+            ROOT.parent / "pixio-api-workers" / "web" / "src" / "components"
+            / "workspace" / "agent-panel.tsx"
+        )
+        if not panel.is_file():
+            self.skipTest("the Pixio web app is not checked out beside this repo")
+        self.text = panel.read_text(encoding="utf-8")
+
+    def test_no_provider_specific_labels(self):
+        for phrase in ("OpenRouter key", "Add an OpenRouter key", '"OPENROUTER_API_KEY'):
+            self.assertNotIn(
+                phrase, self.text,
+                f"{phrase!r} is shown whichever provider is selected",
+            )

@@ -246,12 +246,15 @@ async def pixio_agent_get_config(request):
                     "id": "openrouter",
                     "label": "OpenRouter",
                     "key_prefix": "sk-or-v1-",
+                    # the machine secret that sets this key without the UI
+                    "key_env": "OPENROUTER_API_KEY",
                     "has_key": bool(resolve_api_key("openrouter")),
                 },
                 {
                     "id": "machine",
                     "label": "Machine",
                     "key_prefix": "mach_",
+                    "key_env": "PIXIO_AGENT_API_KEY",
                     "has_key": bool(resolve_api_key("machine")),
                 },
             ],
