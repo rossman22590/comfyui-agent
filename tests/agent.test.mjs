@@ -581,3 +581,146 @@ test("exposing an aspect ratio carries its choices; exposing an image replaces t
     LiteGraph.createNode = realCreate;
   }
 });
+
+test("an external input is picked by what the socket accepts, and never faked", async () => {
+  forgetObjectInfo();
+  resetGraph();
+  // Only the integer node is installed, so an int is all we can offer.
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        ComfyUIDeployExternalNumberInt: {
+          input: { required: { input_id: ["STRING"] } },
+          output: ["INT"],
+        },
+        ComfyUIDeployExternalEnum: {
+          input: { required: { input_id: ["STRING"] } },
+          output: ["*"],
+        },
+      }),
+    );
+
+  // ComfyUI's own rule, which is what filters the menu when you drag off a dot.
+  const asked = [];
+  LiteGraph.isValidConnection = (a, b) => {
+    asked.push([a, b]);
+    const x = String(a ?? "*").toUpperCase();
+    const y = String(b ?? "*").toUpperCase();
+    return x === "*" || y === "*" || x === y;
+  };
+  const realCreate = LiteGraph.createNode;
+  LiteGraph.createNode = (type) => ({
+    type, mode: 0, title: type, pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [{ name: "out", type: "*", links: [] }],
+    widgets: ["input_id", "default_value", "display_name", "description"].map((name) => ({
+      name, type: "text", value: "", options: {},
+    })),
+    // a socket that will not take this type simply refuses, exactly as
+    // LiteGraph does — no throw, no link, nothing to notice unless you look
+    connect(slot, target, targetSlot) {
+      const to = target.inputs[targetSlot];
+      if (!LiteGraph.isValidConnection(this.outputs[slot].type, to.type)) return null;
+      to.link = 7;
+      this.outputs[slot].links.push(7);
+      return { id: 7 };
+    },
+  });
+
+  try {
+    const node = {
+      type: "KSampler", mode: 0, title: "Sampler", pos: [400, 0], size: [300, 200],
+      widgets: [{ name: "cfg", type: "number", value: 7.5, options: { min: 0, max: 30 } }],
+      inputs: [{ name: "cfg", type: "FLOAT", link: null }],
+      outputs: [],
+    };
+    app.graph.add(node);
+
+    // INT into a FLOAT socket is not a connection ComfyUI would offer, and the
+    // old code made it anyway, then reported success over a node wired to
+    // nothing. Refusing outright is the only honest answer.
+    await assert.rejects(
+      () => TOOL_IMPL.expose_input({ node: node.id, widget: "cfg" }),
+      /does not accept|not installed/,
+    );
+    assert.ok(asked.length > 0, "the graph's own compatibility rule was consulted");
+    assert.equal(
+      app.graph._nodes.filter((n) => String(n.type).startsWith("ComfyUIDeploy")).length,
+      0,
+      "and no orphan input was left behind on the canvas",
+    );
+    assert.equal(node.inputs[0].link, null, "the socket is untouched");
+
+    // The same widget as a choice list picks the wildcard Enum, which connects.
+    const choice = {
+      type: "Sampler", mode: 0, title: "S", pos: [0, 400], size: [200, 100],
+      widgets: [{ name: "scheduler", type: "combo", value: "normal",
+                  options: { values: ["normal", "karras"] } }],
+      inputs: [{ name: "scheduler", type: "COMBO", link: null }],
+      outputs: [],
+    };
+    app.graph.add(choice);
+    const ok = await TOOL_IMPL.expose_input({ node: choice.id, widget: "scheduler" });
+    assert.equal(ok.exposed.type, "ComfyUIDeployExternalEnum");
+    assert.equal(choice.inputs[0].link, 7, "the wildcard Enum does connect");
+  } finally {
+    LiteGraph.createNode = realCreate;
+    delete LiteGraph.isValidConnection;
+  }
+});
+
+test("a media loader is only deleted once its consumers are safely across", async () => {
+  forgetObjectInfo();
+  resetGraph();
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        ComfyUIDeployExternalImage: {
+          input: { required: { input_id: ["STRING"] } },
+          output: ["IMAGE"],
+        },
+      }),
+    );
+  const realCreate = LiteGraph.createNode;
+  LiteGraph.createNode = (type) => ({
+    type, mode: 0, title: type, pos: [0, 0], size: [200, 100],
+    inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+    widgets: ["input_id", "default_value_url", "display_name", "description"].map((name) => ({
+      name, type: "text", value: "", options: {},
+    })),
+    connect() {
+      return null; // the consumer refuses, however that comes about
+    },
+  });
+
+  try {
+    const loader = {
+      type: "LoadImage", mode: 0, title: "Load", pos: [0, 0], size: [200, 100],
+      widgets: [{ name: "image", type: "combo", value: "a.png", options: { values: ["a.png"] } }],
+      inputs: [], outputs: [{ name: "IMAGE", type: "IMAGE", links: [11] }],
+    };
+    const consumer = {
+      type: "VAEEncode", mode: 0, title: "Encode", pos: [400, 0], size: [200, 100],
+      widgets: [], inputs: [{ name: "pixels", type: "IMAGE", link: 11 }], outputs: [],
+    };
+    app.graph.add(loader);
+    app.graph.add(consumer);
+    app.graph.links = { 11: { id: 11, origin_id: loader.id, target_id: consumer.id, target_slot: 0 } };
+
+    await assert.rejects(
+      () => TOOL_IMPL.expose_input({ node: loader.id, replace: true }),
+      /will not accept/,
+    );
+    assert.ok(
+      app.graph.getNodeById(loader.id),
+      "the loader still exists rather than being deleted out from under a dangling consumer",
+    );
+    assert.equal(consumer.inputs[0].link, 11, "and the consumer is still fed");
+    assert.equal(
+      app.graph._nodes.filter((n) => n.type === "ComfyUIDeployExternalImage").length,
+      0,
+      "with no half-made input left over",
+    );
+  } finally {
+    LiteGraph.createNode = realCreate;
+  }
+});

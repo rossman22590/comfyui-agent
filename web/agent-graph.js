@@ -1941,7 +1941,59 @@ TOOL_IMPL.view_canvas = async () => {
 // Node types are discovered from what is installed, never assumed.
 
 const DEPLOY_INPUT_PREFIX = "ComfyUIDeployExternal";
-const DEPLOY_OUTPUT_PREFIX = "ComfyUIDeployOutput";
+const DEPLOY_OUTPUT_PREFIX = "ComfyDeployOutput";
+
+// Every external input the run form can actually render a field for, taken from
+// the app's own registry rather than guessed from the class names. A node
+// outside this list may well be installed, but the form falls through to
+// "Unable to render node", so exposing one produces an input nobody can fill in.
+// The value is what a caller sends.
+const DEPLOY_INPUTS = {
+  ComfyUIDeployExternalText: "string",
+  ComfyUIDeployExternalTextAny: "string",
+  ComfyUIDeployExternalTextSingleLine: "string",
+  ComfyUIDeployExternalImage: "public image url",
+  ComfyUIDeployExternalImageAlpha: "public image url, with alpha",
+  ComfyUIDeployExternalImageBatch: "array of image urls",
+  ComfyUIDeployExternalVideo: "public video url",
+  ComfyUIDeployExternalAudio: "public audio url",
+  ComfyUIDeployExternalFile: "public file url; options is an accept filter",
+  ComfyUIDeployExternalNumber: "float",
+  ComfyUIDeployExternalNumberInt: "integer",
+  ComfyUIDeployExternalNumberSlider: "float, shown as a slider between min and max",
+  ComfyUIDeployExternalNumberSliderInt: "integer, shown as a slider",
+  ComfyUIDeployExternalSeed: "integer, with a randomise button",
+  ComfyUIDeployExternalBoolean: "boolean, shown as a switch",
+  ComfyUIDeployExternalEnum: "one of options, shown as a dropdown",
+  ComfyUIDeployExternalColor: "hex colour, sent as [{r,g,b}]",
+  ComfyUIDeployExternalLora: "lora, picked from what is installed",
+  ComfyUIDeployExternalCheckpoint: "checkpoint, picked from what is installed",
+  ComfyDeployWebscoketImageInput: "binary over the websocket",
+};
+
+function isDeployInput(type) {
+  return Object.hasOwn(DEPLOY_INPUTS, String(type));
+}
+
+/**
+ * The rule ComfyUI itself uses when you drag a link off a socket and it offers
+ * you only the nodes that fit. Asking LiteGraph beats reimplementing its type
+ * table, which is how a wrong-but-plausible pick gets made.
+ */
+function canConnect(fromType, toType) {
+  if (typeof LiteGraph?.isValidConnection === "function") {
+    return !!LiteGraph.isValidConnection(fromType, toType);
+  }
+  const a = String(fromType ?? "*").toUpperCase();
+  const b = String(toType ?? "*").toUpperCase();
+  return a === "*" || b === "*" || a === "" || b === "" || a === b;
+}
+
+/** What a node type emits from its first output, per this machine. */
+function outputTypeOf(type, info) {
+  const declared = info?.[type]?.output;
+  return Array.isArray(declared) ? declared[0] : declared;
+}
 
 function snakeCase(text) {
   return String(text)
@@ -1953,37 +2005,56 @@ function snakeCase(text) {
 
 function deployNodeType(suffix, info) {
   const type = `${DEPLOY_INPUT_PREFIX}${suffix}`;
-  return info[type] ? type : null;
+  return info[type] && isDeployInput(type) ? type : null;
 }
 
-/** The External node that matches a widget, from what this machine has. */
-function externalTypeForWidget(node, widget, info) {
-  const pick = (...suffixes) => suffixes.map((s) => deployNodeType(s, info)).find(Boolean) ?? null;
+/** The External nodes that could stand in for a widget, best first. */
+function externalCandidates(node, widget) {
   const name = String(widget?.name ?? "").toLowerCase();
   const values = Array.isArray(widget?.options?.values) ? widget.options.values : null;
-
-  // a seed is an int, but it has its own node carrying the randomise semantics
-  if (name === "seed" || name === "noise_seed") return pick("Seed", "NumberInt");
-  if (name === "ckpt_name") return pick("Checkpoint", "Enum");
-  if (name === "lora_name") return pick("Lora", "Enum");
-  // any fixed set of choices — sampler, scheduler, aspect_ratio, resolution
-  if (values) return pick("Enum", "Text");
-
   const socket = (node.inputs ?? []).find((i) => i.name === widget?.name);
   const socketType = String(socket?.type ?? "").toUpperCase();
-  if (socketType === "BOOLEAN" || typeof widget?.value === "boolean") return pick("Boolean", "Text");
-  if (socketType === "INT") return pick("NumberInt", "Number");
-  if (socketType === "FLOAT") return pick("Number", "NumberInt");
+
+  // a seed is an int, but it has its own node carrying the randomise button
+  if (name === "seed" || name === "noise_seed") return ["Seed", "NumberInt", "Number"];
+  if (name === "ckpt_name") return ["Checkpoint", "Enum"];
+  if (name === "lora_name") return ["Lora", "Enum"];
+  if (name === "color" || name.endsWith("_color")) return ["Color", "Text"];
+  // any fixed set of choices — sampler, scheduler, aspect_ratio, resolution
+  if (values) return ["Enum", "Text"];
+
+  if (socketType === "BOOLEAN" || typeof widget?.value === "boolean") return ["Boolean"];
+  if (socketType === "INT") return ["NumberInt", "NumberSliderInt", "Number"];
+  if (socketType === "FLOAT") return ["Number", "NumberSlider", "NumberInt"];
   if (typeof widget?.value === "number") {
-    return Number.isInteger(widget.value) ? pick("NumberInt", "Number") : pick("Number");
+    return Number.isInteger(widget.value)
+      ? ["NumberInt", "NumberSliderInt", "Number"]
+      : ["Number", "NumberSlider"];
   }
-  return pick("Text");
+  return ["Text", "TextSingleLine", "TextAny"];
+}
+
+/**
+ * The External node that matches a widget: the first candidate this machine
+ * actually has whose output the target socket will accept. Filtering on the
+ * socket is the point — a fallback that cannot connect leaves a dead node on
+ * the canvas, and the old code reported that as a success.
+ */
+function externalTypeForWidget(node, widget, info) {
+  const socket = (node.inputs ?? []).find((i) => i.name === widget?.name);
+  const installed = externalCandidates(node, widget)
+    .map((suffix) => deployNodeType(suffix, info))
+    .filter(Boolean);
+  if (!socket) return installed[0] ?? null;
+  return (
+    installed.find((type) => canConnect(outputTypeOf(type, info), socket.type)) ?? null
+  );
 }
 
 function existingInputIds(graph) {
   const ids = new Map();
   for (const node of nodesOf(graph)) {
-    if (!String(node.type).startsWith(DEPLOY_INPUT_PREFIX)) continue;
+    if (!isDeployInput(node.type)) continue;
     const widget = (node.widgets ?? []).find((w) => w.name === "input_id");
     if (widget?.value) ids.set(String(widget.value), node.id);
   }
@@ -2075,7 +2146,17 @@ async function exposeWidgetAsInput({ graph, info, node, args }) {
       `expose_input: "${widgetName}" on ${node.type} (#${node.id}) has no input socket to drive. ${describeSlots(node)}`,
     );
   }
+  // connect() declines a type it cannot take and says so only in its return
+  // value, so check the socket itself: a node left sitting there unwired, with
+  // the tool reporting success, is worse than a clear failure.
+  const before = node.inputs[inIdx].link;
   external.connect(0, node, inIdx);
+  if (node.inputs[inIdx].link == null || node.inputs[inIdx].link === before) {
+    graph.remove(external);
+    throw new Error(
+      `expose_input: ${type} outputs ${outputTypeOf(type, info) ?? "?"}, which ${node.type} (#${node.id}).${widgetName} does not accept (${(node.inputs[inIdx].type ?? "?")}). Nothing was changed.`,
+    );
+  }
   redraw();
 
   return {
@@ -2127,7 +2208,24 @@ function replaceWithExternal({ graph, info, node, args }) {
   // the image node takes a URL as its fallback rather than a value
   setIfPresent(external, "default_value_url", args.default_value_url);
 
-  for (const consumer of consumers) external.connect(0, consumer.node, consumer.slot);
+  // The loader is about to be deleted, so every consumer has to be safely
+  // across first. A silent refusal here used to leave the consumer dangling
+  // with no way back — put the graph as it was and say what happened instead.
+  const failed = [];
+  for (const consumer of consumers) {
+    const before = consumer.node.inputs?.[consumer.slot]?.link;
+    external.connect(0, consumer.node, consumer.slot);
+    const after = consumer.node.inputs?.[consumer.slot]?.link;
+    if (after == null || after === before) failed.push(consumer);
+  }
+  if (failed.length) {
+    graph.remove(external);
+    throw new Error(
+      `expose_input: ${type} outputs ${outputTypeOf(type, info) ?? kind}, which ${failed
+        .map((c) => `${c.node.type} (#${c.node.id}) input ${c.slot}`)
+        .join(", ")} will not accept. ${node.type} (#${node.id}) was left alone.`,
+    );
+  }
   graph.remove(node);
   redraw();
 
@@ -2152,7 +2250,7 @@ async function checkDeployable() {
   const seen = new Map();
 
   for (const node of nodes) {
-    if (!String(node.type).startsWith(DEPLOY_INPUT_PREFIX)) continue;
+    if (!isDeployInput(node.type)) continue;
     const values = Object.fromEntries((node.widgets ?? []).map((w) => [w.name, w.value]));
     const id = String(values.input_id ?? "");
     const wired = (node.outputs?.[0]?.links ?? []).length;
@@ -2187,7 +2285,7 @@ async function checkDeployable() {
   const worth = /^(text|prompt|seed|noise_seed|width|height|length|denoise|cfg|steps|strength_model|aspect_ratio|resolution|filename_prefix)$/;
   const suggestions = [];
   for (const node of nodes) {
-    if (String(node.type).startsWith(DEPLOY_INPUT_PREFIX)) continue;
+    if (isDeployInput(node.type)) continue;
     for (const widget of node.widgets ?? []) {
       if (!worth.test(widget.name ?? "")) continue;
       if (driven.has(`${node.id}:${widget.name}`)) continue;
