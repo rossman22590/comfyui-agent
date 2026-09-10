@@ -1284,6 +1284,76 @@ async function listWorkflowTemplates({ query = "", limit = 20 } = {}) {
  * discovers the truth on Run. Every combo widget is checked against the
  * options this machine actually offers, including inside subgraphs.
  */
+// ---------------------------------------------------------------------------
+// what the template's own notes say
+// ---------------------------------------------------------------------------
+//
+// Comfy-Org templates carry their model downloads in a MarkdownNote, not in any
+// structured field: a "## Model links" heading, a bold folder name, then
+// [filename.safetensors](https://huggingface.co/.../filename.safetensors) for
+// each one. That is the only place the URL exists, so a workflow that will not
+// run because a file is missing is also carrying the answer — as prose, several
+// hundred characters past where get_graph truncates a widget value.
+
+const NOTE_TYPES = new Set(["Note", "MarkdownNote", "Note Plus (mtb)"]);
+
+function noteNodes(graph = app.graph) {
+  const found = [];
+  const walk = (g, target) => {
+    for (const node of nodesOf(g)) {
+      if (NOTE_TYPES.has(node.type)) {
+        const text = (node.widgets ?? [])
+          .map((w) => w.value)
+          .filter((v) => typeof v === "string")
+          .join("\n")
+          .trim();
+        if (text) found.push({ node_id: node.id, type: node.type, title: node.title, text, ...(target ? { target } : {}) });
+      }
+      if (isSubgraphNode(node)) walk(node.subgraph, node.id);
+    }
+  };
+  walk(graph, null);
+  return found;
+}
+
+/** Model downloads named in a note: [file](url), or a bare url ending in a file. */
+function modelLinksFromNotes(notes) {
+  const links = [];
+  const seen = new Set();
+  const add = (filename, url, folder) => {
+    const key = `${filename}|${url}`;
+    if (!filename || seen.has(key)) return;
+    seen.add(key);
+    links.push({ filename, url, ...(folder ? { folder } : {}) });
+  };
+  for (const note of notes) {
+    // the bold heading above a group of links is the folder they belong in
+    let folder = null;
+    for (const line of note.text.split(/\r?\n/)) {
+      const heading = line.match(/^\s*(?:#{1,6}\s*)?\*\*([A-Za-z0-9_\/ -]+)\*\*\s*$/);
+      if (heading) {
+        folder = heading[1].trim();
+        continue;
+      }
+      for (const m of line.matchAll(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g)) {
+        const label = m[1].trim();
+        const url = m[2];
+        const fromUrl = decodeURIComponent(url.split(/[?#]/)[0].split("/").pop() ?? "");
+        // the label is usually the filename; fall back to the url's last segment
+        add(MODEL_FILE.test(label) ? label : fromUrl, url, folder);
+      }
+      for (const m of line.matchAll(/(?<!\]\()(https?:\/\/[^\s)\]]+)/g)) {
+        const url = m[1];
+        const fromUrl = decodeURIComponent(url.split(/[?#]/)[0].split("/").pop() ?? "");
+        if (MODEL_FILE.test(fromUrl)) add(fromUrl, url, folder);
+      }
+    }
+  }
+  return links;
+}
+
+const MODEL_FILE = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx)$/i;
+
 function missingModelFiles(info) {
   const missing = [];
   const walk = (graph, scope) => {
@@ -1312,6 +1382,18 @@ function missingModelFiles(info) {
     }
   };
   walk(app.graph, "root");
+
+  // The note that came with the workflow usually names the exact download, so
+  // attach it rather than making the user go and find it.
+  const links = modelLinksFromNotes(noteNodes());
+  for (const entry of missing) {
+    const match = links.find((l) => l.filename === entry.wanted)
+      ?? links.find((l) => l.filename.toLowerCase() === String(entry.wanted).toLowerCase());
+    if (match) {
+      entry.download_url = match.url;
+      if (match.folder) entry.download_folder = match.folder;
+    }
+  }
   return missing;
 }
 
@@ -1341,10 +1423,11 @@ async function loadWorkflowTemplate({ source = "core", name }) {
     loaded: `${source}/${name}`,
     missing_node_types: missing,
     missing_models: missingModels,
+    model_links: modelLinksFromNotes(noteNodes()),
     runnable: missing.length === 0 && missingModels.length === 0,
     ...(missing.length || missingModels.length
       ? {
-          note: "This template is NOT runnable as loaded. Tell the user exactly what is missing before claiming anything works: swap each widget to an installed option from installed_options, or say what they need to download.",
+          note: "This template is NOT runnable as loaded. Tell the user exactly what is missing before claiming anything works: swap each widget to an installed option from installed_options, or say what they need to download. A missing model carrying download_url has the link from the template's own note — give it, with download_folder, rather than searching for one.",
         }
       : {}),
     snapshot,
@@ -2315,6 +2398,30 @@ async function checkDeployable() {
 TOOL_IMPL.expose_input = async (args) => exposeInput(args ?? {});
 TOOL_IMPL.check_deployable = async () => checkDeployable();
 MUTATING_TOOLS.add("expose_input");
+
+TOOL_IMPL.read_notes = async (args) => {
+  const { graph } = graphFor(args?.target);
+  const notes = noteNodes(graph);
+  const links = modelLinksFromNotes(notes);
+  // The point of reading the notes is usually "what does this need and have I
+  // got it", so answer both halves at once rather than making the model call
+  // load_workflow_template — which only works for a template, not the user's
+  // own workflow — to find out what is missing.
+  const missing = missingModelFiles(await getObjectInfo());
+  return {
+    notes,
+    model_links: links,
+    missing_models: missing,
+    ...(missing.length
+      ? {
+          note: "Each missing model carrying download_url has the link from this workflow's own note; download_folder is where it goes under models/. Give the user those rather than searching for a download.",
+        }
+      : {}),
+    ...(notes.length
+      ? {}
+      : { note: "This workflow has no Note or MarkdownNote nodes, so it documents nothing about itself." }),
+  };
+};
 
 TOOL_IMPL.find_in_graph = async (args) => findInGraph(args);
 TOOL_IMPL.new_workflow = async (args) => newWorkflow(args);

@@ -407,6 +407,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "read_notes",
+            "description": (
+                "Read the Note and MarkdownNote nodes in the graph, in full, and the model downloads they "
+                "name. Comfy-Org templates put their download links here and nowhere else — a "
+                "'## Model links' heading, a bold folder name, then [file.safetensors](https://…) for "
+                "each one — so this is where the answer lives when a workflow needs a file the machine "
+                "does not have, or when the user asks what a workflow needs or how it works. get_graph "
+                "truncates long widget values, which cuts these notes off part way; this does not."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"description": "Subgraph node id, to read the notes inside one."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "check_deployable",
             "description": (
                 "Audit the graph as an API endpoint: what is exposed, what it feeds, whether there is an "
@@ -603,7 +623,7 @@ SYSTEM_PROMPT = """You are the Pixio Workflow Agent — a senior ComfyUI enginee
 
 **3 — Find the right shape.** For anything new, search list_workflow_templates first: the Comfy-Org library ('comfy-org') is 600+ maintained workflows, current with families newer than your training (the authority when it disagrees with the recipes below). Search by family: "wan video", "flux", "qwen image", "ace step audio". Adapt the closest match rather than assembling from memory. It ships local and `api_*` flavours of many models; take the local one unless asked otherwise. search_node_types finds exact class names for a family — never guess one — and get_node_type_details gives exact inputs, output indices and combo values. A result marked `hosted: true` is a paid endpoint. A MODEL name often matches one of those and nothing else, because an installed model is a FILE loaded by a generic node — search list_models for the same name before concluding it is the only way.
 
-**4 — Confirm it can run here.** A loaded template reports `runnable`, `missing_node_types` and `missing_models` — read them before you say a word about the workflow, and never call it ready while either is non-empty. Each missing model carries `installed_options`: switch the widget to one of those, or say what to download. Also check_nodes_available for every type you are not certain of, and for a template's requires_custom_nodes. All present → continue silently. Anything missing → stop and say what is missing, which pack ships it (name and URL from the result, never invented), and that it needs adding to this machine's custom nodes and a rebuild. In the same reply offer the best workflow you CAN build from what is installed, naming any credit cost. list_machine_custom_nodes shows which packs the machine was built with. Mid-build, resolve an unknown type before trying alternatives.
+**4 — Confirm it can run here.** A loaded template reports `runnable`, `missing_node_types` and `missing_models` — read them before you say a word about the workflow, and never call it ready while either is non-empty. Each missing model carries `installed_options` — switch the widget to one of those — plus `download_url` and `download_folder` when a note names them. Templates keep downloads in a MarkdownNote and nowhere else: read_notes returns those, and the note in full, for any workflow. Also check_nodes_available for every type you are not certain of, and for a template's requires_custom_nodes. All present → continue silently. Anything missing → stop and say what is missing, which pack ships it (name and URL from the result, never invented), and that it needs adding to this machine's custom nodes and a rebuild. In the same reply offer the best workflow you CAN build from what is installed, naming any credit cost. list_machine_custom_nodes shows which packs the machine was built with. Mid-build, resolve an unknown type before trying alternatives.
 
 **5 — Build.** A batch returning `user_edited_canvas` means the user changed something mid-build: what landed is kept, the rest was refused. Re-read with get_graph and continue from what is there; never re-send the refused ops. One apply_graph_ops batch where possible: add_node with refs and widgets, then connects by ref, then arrange. Your ops stream onto the canvas as you write them and the user watches it assemble — so emit in build order (loaders → conditioning → sampling → decode → output → connects → arrange), never re-emit an op, and never emit a connect before the node it references. Sensible defaults, real titles. For API/deployable work, expose_input each value the caller controls and each image/video/audio they supply, then check_deployable and fix what it reports.
 

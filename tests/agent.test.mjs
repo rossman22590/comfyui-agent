@@ -726,3 +726,75 @@ test("a media loader is only deleted once its consumers are safely across", asyn
     LiteGraph.createNode = realCreate;
   }
 });
+
+test("a template's note is where the download links live, so read them and match them up", async () => {
+  forgetObjectInfo();
+  resetGraph();
+  // The shape Comfy-Org actually ships: a heading, a bold folder name, then a
+  // markdown link per file. Taken from humo_video_driven_by_voice.json.
+  const noteText = [
+    "## Model links",
+    "",
+    "**diffusion_models**",
+    "",
+    "- [humo_17B_fp8_e4m3fn.safetensors](https://huggingface.co/Comfy-Org/HuMo_ComfyUI/resolve/main/split_files/diffusion_models/humo_17B_fp8_e4m3fn.safetensors)",
+    "",
+    "**vae**",
+    "- [wan_2.1_vae.safetensors](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors)",
+    "",
+    "See also https://docs.comfy.org/get_started for setup.",
+  ].join("\n");
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        UNETLoader: { input: { required: { unet_name: [["something_else.safetensors"]] } }, output: ["MODEL"] },
+        VAELoader: { input: { required: { vae_name: [["wan_2.1_vae.safetensors"]] } }, output: ["VAE"] },
+      }),
+    );
+
+  app.graph.add({
+    type: "MarkdownNote", mode: 0, title: "Model links", pos: [0, 0], size: [400, 300],
+    widgets: [{ name: "text", type: "text", value: noteText, options: {} }],
+    inputs: [], outputs: [],
+  });
+  // wants a file this machine does not have — the note knows where to get it
+  app.graph.add({
+    type: "UNETLoader", mode: 0, title: "Load model", pos: [500, 0], size: [300, 60],
+    widgets: [{ name: "unet_name", type: "combo", value: "humo_17B_fp8_e4m3fn.safetensors", options: {} }],
+    inputs: [], outputs: [],
+  });
+  // and one it does have, which must NOT be reported as missing
+  app.graph.add({
+    type: "VAELoader", mode: 0, title: "Load VAE", pos: [500, 200], size: [300, 60],
+    widgets: [{ name: "vae_name", type: "combo", value: "wan_2.1_vae.safetensors", options: {} }],
+    inputs: [], outputs: [],
+  });
+
+  const res = await TOOL_IMPL.read_notes({});
+
+  // get_graph truncates a widget value at 240 characters, which cuts this note
+  // off after the first link. read_notes is the tool that does not.
+  assert.equal(res.notes.length, 1);
+  assert.equal(res.notes[0].text.length, noteText.length, "the note is returned whole");
+  assert.ok(res.notes[0].text.length > 240, "and it is longer than get_graph would show");
+
+  const byFile = Object.fromEntries(res.model_links.map((l) => [l.filename, l]));
+  assert.deepEqual(Object.keys(byFile).sort(), [
+    "humo_17B_fp8_e4m3fn.safetensors",
+    "wan_2.1_vae.safetensors",
+  ], "every model link is found, and the docs url is not mistaken for one");
+  assert.equal(byFile["humo_17B_fp8_e4m3fn.safetensors"].folder, "diffusion_models",
+    "the bold heading above a link says which folder it belongs in");
+  assert.equal(byFile["wan_2.1_vae.safetensors"].folder, "vae");
+
+  assert.equal(res.missing_models.length, 1, "only the file that is really absent");
+  const [missing] = res.missing_models;
+  assert.equal(missing.wanted, "humo_17B_fp8_e4m3fn.safetensors");
+  assert.equal(
+    missing.download_url,
+    "https://huggingface.co/Comfy-Org/HuMo_ComfyUI/resolve/main/split_files/diffusion_models/humo_17B_fp8_e4m3fn.safetensors",
+    "and it carries the link out of the workflow's own note",
+  );
+  assert.equal(missing.download_folder, "diffusion_models");
+});
