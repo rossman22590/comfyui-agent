@@ -798,3 +798,119 @@ test("a template's note is where the download links live, so read them and match
   );
   assert.equal(missing.download_folder, "diffusion_models");
 });
+
+/** A stand-in for ComfyUI's api: an event target plus a queuePrompt. */
+function fakeApi(queuePrompt) {
+  const listeners = new Map();
+  return {
+    queue: [],
+    queuePrompt,
+    addEventListener(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(fn);
+    },
+    removeEventListener(name, fn) {
+      listeners.get(name)?.delete(fn);
+    },
+    emit(name, detail) {
+      for (const fn of listeners.get(name) ?? []) fn({ detail });
+    },
+    listenerCount() {
+      let n = 0;
+      for (const set of listeners.values()) n += set.size;
+      return n;
+    },
+  };
+}
+
+async function runFixture(queuePrompt, { outputNode = true } = {}) {
+  forgetObjectInfo();
+  resetGraph();
+  // output urls are built against the page origin, which node does not have
+  globalThis.location ??= { origin: "http://127.0.0.1:8188" };
+  globalThis.fetch = async (url) =>
+    String(url).includes("/validate")
+      ? new Response(JSON.stringify({ valid: true }))
+      : new Response(JSON.stringify({ SaveImage: { input: {}, output: [], output_node: true } }));
+  if (outputNode) {
+    app.graph.add({
+      type: "SaveImage", mode: 0, title: "Save", pos: [0, 0], size: [200, 60],
+      widgets: [], inputs: [], outputs: [],
+    });
+  }
+  app.graphToPrompt = async () => ({
+    output: { 1: { class_type: "SaveImage" }, 2: { class_type: "KSampler" } },
+    workflow: { nodes: [] },
+  });
+  const api = fakeApi(queuePrompt);
+  app.api = api;
+  return { api, run: TOOL_IMPL.run_workflow({ timeout_seconds: 10 }) };
+}
+
+test("a run reports on its own prompt, not on whatever else the machine is doing", async () => {
+  let resolveQueue;
+  const { api, run } = await runFixture(
+    () => new Promise((r) => { resolveQueue = r; }),
+  );
+  await new Promise((r) => setTimeout(r, 0));
+
+  // Someone else's job fails while ours is still being accepted. The old code
+  // took app.queuePrompt's boolean, left promptId null, and reported this
+  // stranger's traceback as our result.
+  api.emit("execution_error", {
+    prompt_id: "someone-elses-prompt",
+    node_id: "9",
+    exception_message: "CUDA out of memory",
+  });
+
+  resolveQueue({ prompt_id: "ours-1234" });
+  await new Promise((r) => setTimeout(r, 0));
+
+  api.emit("executed", {
+    prompt_id: "ours-1234",
+    node: "1",
+    output: { images: [{ filename: "out.png", type: "output", subfolder: "" }] },
+  });
+  api.emit("executing", { prompt_id: "ours-1234", node: "1" });
+  api.emit("execution_success", { prompt_id: "ours-1234" });
+
+  const result = await run;
+  assert.equal(result.status, "success", "the stranger's failure is not our failure");
+  assert.ok(result.outputs["1"], "our own output came through");
+  assert.equal(result.nodes_executed, 1);
+  assert.equal(result.nodes_in_prompt, 2, "and it says what ran, not what was hoped for");
+  assert.equal(api.listenerCount(), 0, "listeners are removed when the run settles");
+});
+
+test("a prompt the server refuses is reported as refused, not as still running", async () => {
+  const refusal = Object.assign(new Error("Prompt has failed validation"), {
+    response: { node_errors: { 2: { errors: [{ message: "value not in list" }] } } },
+  });
+  const { run } = await runFixture(async () => {
+    throw refusal;
+  });
+  const result = await run;
+  assert.equal(result.queued, false);
+  assert.equal(result.status, "error");
+  assert.ok(
+    result.node_errors?.["2"],
+    "the server said which node it objected to, so pass that on",
+  );
+  assert.match(result.note, /refused/);
+});
+
+test("a graph our own validator calls broken is never queued", async () => {
+  let queued = false;
+  // no output node, so the client-side check objects
+  const { run } = await runFixture(
+    async () => { queued = true; return { prompt_id: "x" }; },
+    { outputNode: false },
+  );
+  const result = await run;
+  assert.equal(result.queued, false);
+  assert.equal(queued, false, "and the server was never asked");
+  assert.ok(
+    result.validation.client_issues.some((i) => /output node/.test(i.message)),
+    "the reason is the one our validator gave",
+  );
+});

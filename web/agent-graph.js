@@ -1526,19 +1526,46 @@ async function runWorkflow({ timeout_seconds = 300 } = {}) {
   if (!api) throw new Error("ComfyUI api object unavailable — cannot watch execution");
 
   const validation = await validateGraph();
-  if (validation.server && validation.server.valid === false) {
+  // The server's verdict is authoritative, but our own checks catch what it
+  // cannot see — a required input left unlinked reaches the server as a prompt
+  // it will happily reject. Queuing a graph our own validator just called
+  // broken wastes the run and hides the reason behind an execution error.
+  if (
+    (validation.server && validation.server.valid === false) ||
+    (validation.client_issues ?? []).length
+  ) {
     return { queued: false, reason: "validation failed — fix these first", validation };
   }
 
-  const { output } = await app.graphToPrompt();
+  const { output, workflow } = await app.graphToPrompt();
   const expected = Object.keys(output ?? {}).length;
   if (!expected) throw new Error("nothing to execute — the graph has no active output node");
 
   return new Promise((resolve) => {
     const outputs = {};
+    const executed = new Set();
     let promptId = null;
     let settled = false;
     let lastNode = null;
+
+    // Events arrive on a socket shared with every other run on this machine,
+    // and the prompt id that tells ours apart only comes back from the queue
+    // call. Anything that lands before then is held rather than assumed to be
+    // ours — the alternative is reporting a stranger's traceback as our own.
+    let idKnown = false;
+    const held = [];
+    const gate = (handler) => (event) => {
+      if (!idKnown) {
+        held.push([handler, event]);
+        return;
+      }
+      handler(event);
+    };
+    const release = () => {
+      idKnown = true;
+      for (const [handler, event] of held) handler(event);
+      held.length = 0;
+    };
 
     const finish = (result) => {
       if (settled) return;
@@ -1599,14 +1626,28 @@ async function runWorkflow({ timeout_seconds = 300 } = {}) {
     };
 
     const onExecuting = (event) => {
-      const node = event.detail?.node ?? event.detail;
-      if (node) lastNode = node;
+      const d = event.detail ?? {};
+      if (promptId && d.prompt_id && d.prompt_id !== promptId) return;
+      const node = d.node ?? event.detail;
+      if (node) {
+        lastNode = node;
+        executed.add(String(node));
+      }
     };
+
+    // what actually ran, not what we hoped would run
+    const tally = () => ({
+      nodes_executed: executed.size,
+      nodes_in_prompt: expected,
+      ...(executed.size && executed.size < expected
+        ? { note: "fewer nodes ran than the prompt contained — the rest were cached or skipped" }
+        : {}),
+    });
 
     const onSuccess = (event) => {
       const d = event.detail ?? {};
       if (promptId && d.prompt_id && d.prompt_id !== promptId) return;
-      finish({ queued: true, status: "success", outputs, node_count: expected });
+      finish({ queued: true, status: "success", outputs, ...tally() });
     };
 
     const onStatus = () => {
@@ -1614,23 +1655,27 @@ async function runWorkflow({ timeout_seconds = 300 } = {}) {
       if (settled || !promptId) return;
       const remaining = api.queue?.length;
       if (remaining === 0 && Object.keys(outputs).length) {
-        finish({ queued: true, status: "success", outputs, node_count: expected });
+        finish({ queued: true, status: "success", outputs, ...tally() });
       }
     };
 
     function cleanup() {
-      api.removeEventListener("execution_error", onError);
-      api.removeEventListener("executed", onExecuted);
-      api.removeEventListener("executing", onExecuting);
-      api.removeEventListener("execution_success", onSuccess);
+      api.removeEventListener("execution_error", gatedError);
+      api.removeEventListener("executed", gatedExecuted);
+      api.removeEventListener("executing", gatedExecuting);
+      api.removeEventListener("execution_success", gatedSuccess);
       api.removeEventListener("status", onStatus);
       clearTimeout(timer);
     }
 
-    api.addEventListener("execution_error", onError);
-    api.addEventListener("executed", onExecuted);
-    api.addEventListener("executing", onExecuting);
-    api.addEventListener("execution_success", onSuccess);
+    const gatedError = gate(onError);
+    const gatedExecuted = gate(onExecuted);
+    const gatedExecuting = gate(onExecuting);
+    const gatedSuccess = gate(onSuccess);
+    api.addEventListener("execution_error", gatedError);
+    api.addEventListener("executed", gatedExecuted);
+    api.addEventListener("executing", gatedExecuting);
+    api.addEventListener("execution_success", gatedSuccess);
     api.addEventListener("status", onStatus);
 
     const timer = setTimeout(
@@ -1646,12 +1691,40 @@ async function runWorkflow({ timeout_seconds = 300 } = {}) {
       Math.min(Math.max(Number(timeout_seconds) || 300, 10), 900) * 1000,
     );
 
-    app
-      .queuePrompt(0, 1)
+    // app.queuePrompt resolves a bare boolean and there is no app.lastPromptId,
+    // so going through it left promptId null forever and every filter above
+    // waved through whatever else the machine was running. The api call
+    // underneath returns the id, and throws — rather than resolving false —
+    // when the server refuses the prompt, which is the difference between
+    // "still running" and "this was never accepted".
+    api
+      .queuePrompt(0, { output, workflow })
       .then((res) => {
-        promptId = res?.prompt_id ?? app.lastPromptId ?? null;
+        promptId = res?.prompt_id ?? null;
+        if (!promptId) {
+          finish({
+            queued: false,
+            status: "error",
+            error: {
+              message:
+                "the server accepted the prompt but returned no prompt_id, so this run cannot be told apart from anything else on the machine",
+            },
+            ...(res?.node_errors ? { node_errors: res.node_errors } : {}),
+          });
+          return;
+        }
+        release();
       })
-      .catch((e) => finish({ queued: false, status: "error", error: { message: e?.message ?? String(e) } }));
+      .catch((e) => {
+        const errors = e?.response?.node_errors ?? e?.node_errors;
+        finish({
+          queued: false,
+          status: "error",
+          error: { message: e?.message ?? String(e) },
+          ...(errors ? { node_errors: errors } : {}),
+          note: "the server refused this prompt — fix what node_errors names, or run validate_workflow",
+        });
+      });
   });
 }
 
